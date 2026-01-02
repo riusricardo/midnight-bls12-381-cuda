@@ -495,6 +495,53 @@ __global__ void histogram_atomic_kernel(
 }
 
 /**
+ * @brief Optimized histogram kernel with warp-level aggregation
+ * 
+ * OPTIMIZATION: Reduces atomic contention by aggregating within warps first.
+ * Uses warp-level ballot and popcount to count matching buckets before
+ * issuing a single atomic per warp instead of per thread.
+ */
+__global__ void histogram_warp_aggregated_kernel(
+    unsigned int* histogram,
+    const unsigned int* indices,
+    int num_samples,
+    int num_buckets
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int lane_id = threadIdx.x & 31;
+    
+    unsigned int bucket = INVALID_BUCKET_INDEX;
+    if (idx < num_samples) {
+        bucket = indices[idx];
+        if (bucket >= (unsigned int)num_buckets) {
+            bucket = INVALID_BUCKET_INDEX; // Mark invalid
+        }
+    }
+    
+    // Warp-level aggregation: find threads with same bucket value
+    // Process each unique bucket value in the warp
+    unsigned int active_mask = __ballot_sync(0xFFFFFFFF, bucket != INVALID_BUCKET_INDEX);
+    
+    while (active_mask != 0) {
+        // Get the bucket value from the first active lane
+        int leader = __ffs(active_mask) - 1;
+        unsigned int leader_bucket = __shfl_sync(0xFFFFFFFF, bucket, leader);
+        
+        // Find all lanes with matching bucket
+        unsigned int match_mask = __ballot_sync(active_mask, bucket == leader_bucket);
+        
+        // Count matches and have leader do single atomic
+        int count = __popc(match_mask);
+        if (lane_id == leader && leader_bucket != INVALID_BUCKET_INDEX) {
+            atomicAdd(&histogram[leader_bucket], count);
+        }
+        
+        // Remove processed lanes from active mask
+        active_mask &= ~match_mask;
+    }
+}
+
+/**
  * @brief Parallel bucket reduction (templated for G1/G2)
  * 
  * Runs one thread per window to perform the triangle summation.
@@ -733,16 +780,16 @@ cudaError_t msm_cuda(
         MSM_CUDA_CHECK(cudaGetLastError());
     }
     
-    // 2. Histogram (Compute bucket sizes) using atomic kernel
+    // 2. Histogram (Compute bucket sizes) using warp-aggregated kernel
     {
         // Initialize sizes to 0
         MSM_CUDA_CHECK(cudaMemsetAsync(d_bucket_sizes, 0, total_buckets * sizeof(unsigned int), stream));
         
-        // Use atomic histogram kernel
+        // Use optimized warp-aggregated histogram kernel (reduces atomics by up to 32×)
         int gpu_capability = get_gpu_compute_capability();
         int threads = get_optimal_block_size(gpu_capability, KernelType::HISTOGRAM);
         int blocks = (num_contributions + threads - 1) / threads;
-        histogram_atomic_kernel<<<blocks, threads, 0, stream>>>(
+        histogram_warp_aggregated_kernel<<<blocks, threads, 0, stream>>>(
             d_bucket_sizes, d_bucket_indices, num_contributions, total_buckets);
         MSM_CUDA_CHECK(cudaGetLastError());
     }
