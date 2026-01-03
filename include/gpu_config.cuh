@@ -148,6 +148,27 @@ struct GPUConfig {
     static constexpr int FQ_SIZE = 48;              // 6 * 8 bytes (base field)
     
     // =========================================================================
+    // MSM-Specific Constants
+    // =========================================================================
+    
+    static constexpr int DEFAULT_THREADS_PER_BUCKET = 8;   // Cooperative threads per bucket
+    static constexpr int MSM_MULTITHREAD_THRESHOLD = 256;  // Bucket count threshold for multithread
+    
+    // =========================================================================
+    // Thread Configuration Constants
+    // =========================================================================
+    
+    static constexpr int REGISTER_HEAVY_MAX_THREADS = 128; // Max threads for register-heavy kernels
+    static constexpr int DEFAULT_COMPUTE_THREADS = 256;    // Default for compute-bound kernels
+    static constexpr int MAX_GRID_BLOCKS = 1 << 20;        // Practical max blocks (1M)
+    
+    // =========================================================================
+    // NTT-Specific Constants
+    // =========================================================================
+    
+    static constexpr int NTT_SHARED_MEM_THRESHOLD = 256;   // Max NTT size for shared memory approach
+    
+    // =========================================================================
     // Singleton Access
     // =========================================================================
     
@@ -202,7 +223,7 @@ struct GPUConfig {
             // Register-heavy: fewer threads to avoid spilling
             case KernelType::REGISTER_HEAVY:
             case KernelType::SCALAR_MUL:
-                return std::min(128, max_threads_per_block);
+                return std::min(REGISTER_HEAVY_MAX_THREADS, max_threads_per_block);
             
             default:
                 return optimal_threads_compute_bound;
@@ -218,9 +239,14 @@ struct GPUConfig {
      * @return Optimal thread count that fits within shared memory limits
      */
     int get_reduction_threads(int element_size, int num_arrays = 2) const {
+        // Guard against invalid inputs
+        if (element_size <= 0) element_size = FR_SIZE;  // Default to Fr size
+        if (num_arrays <= 0) num_arrays = 2;
+        
         // shared_mem = num_arrays * threads * element_size
         // threads = shared_mem / (num_arrays * element_size)
-        int max_threads_by_shared_mem = shared_mem_per_block / (num_arrays * element_size);
+        int divisor = num_arrays * element_size;
+        int max_threads_by_shared_mem = shared_mem_per_block / divisor;
         
         // Round down to multiple of warp size
         max_threads_by_shared_mem = (max_threads_by_shared_mem / warp_size) * warp_size;
@@ -239,6 +265,10 @@ struct GPUConfig {
      * @return Optimal total thread count (divisible by threads_per_group)
      */
     int get_cooperative_threads(int threads_per_group = 8) const {
+        // Guard against invalid input
+        if (threads_per_group <= 0) threads_per_group = 8;
+        threads_per_group = std::min(threads_per_group, max_threads_per_block);
+        
         int threads = optimal_threads_compute_bound;
         // Ensure divisible by threads_per_group
         threads = (threads / threads_per_group) * threads_per_group;
@@ -464,8 +494,21 @@ struct LaunchConfig {
  */
 inline LaunchConfig get_launch_config(int work_size, KernelType type = KernelType::COMPUTE_BOUND) {
     const auto& gpu = GPUConfig::get();
+    
+    // Guard against invalid work_size
+    if (work_size <= 0) {
+        return LaunchConfig(1, 1);  // Minimal safe config
+    }
+    
     int threads = gpu.get_optimal_threads(type);
-    int blocks = (work_size + threads - 1) / threads;
+    
+    // Use int64_t to prevent overflow for large work sizes
+    int64_t blocks64 = (static_cast<int64_t>(work_size) + threads - 1) / threads;
+    
+    // Cap at maximum grid dimension (typically 2^31-1, but we use 2^20 as practical limit)
+    constexpr int MAX_BLOCKS = 1 << 20;  // 1M blocks - practical upper limit
+    int blocks = static_cast<int>(std::min(blocks64, static_cast<int64_t>(MAX_BLOCKS)));
+    
     return LaunchConfig(threads, blocks);
 }
 
@@ -477,7 +520,18 @@ inline LaunchConfig get_launch_config(int work_size, KernelType type = KernelTyp
  * @return LaunchConfig with threads and blocks
  */
 inline LaunchConfig get_launch_config_explicit(int work_size, int threads) {
-    int blocks = (work_size + threads - 1) / threads;
+    const auto& gpu = GPUConfig::get();
+    
+    // Guard against invalid inputs
+    if (work_size <= 0) return LaunchConfig(1, 1);
+    if (threads <= 0) threads = 256;
+    threads = std::min(threads, gpu.max_threads_per_block);
+    
+    // Use int64_t to prevent overflow
+    int64_t blocks64 = (static_cast<int64_t>(work_size) + threads - 1) / threads;
+    constexpr int MAX_BLOCKS = 1 << 20;
+    int blocks = static_cast<int>(std::min(blocks64, static_cast<int64_t>(MAX_BLOCKS)));
+    
     return LaunchConfig(threads, blocks);
 }
 
@@ -490,11 +544,26 @@ inline LaunchConfig get_launch_config_explicit(int work_size, int threads) {
  * @param element_size Size of each element in bytes
  * @return LaunchConfig with threads and blocks
  */
-inline LaunchConfig get_reduction_launch_config(int work_size, int element_size = 32) {
+inline LaunchConfig get_reduction_launch_config(int work_size, int element_size = GPUConfig::FR_SIZE) {
     const auto& gpu = GPUConfig::get();
+    
+    // Guard against invalid inputs
+    if (work_size <= 0) return LaunchConfig(gpu.warp_size, 1);
+    if (element_size <= 0) element_size = GPUConfig::FR_SIZE;
+    
     int threads = gpu.get_reduction_threads(element_size);
-    int blocks = (work_size + 2 * threads - 1) / (2 * threads);
-    return LaunchConfig(threads, blocks);
+    
+    // Use int64_t to prevent overflow
+    int64_t divisor = 2 * static_cast<int64_t>(threads);
+    int64_t blocks64 = (static_cast<int64_t>(work_size) + divisor - 1) / divisor;
+    constexpr int MAX_BLOCKS = 1 << 20;
+    int blocks = static_cast<int>(std::min(blocks64, static_cast<int64_t>(MAX_BLOCKS)));
+    blocks = std::max(blocks, 1);  // At least one block
+    
+    // Calculate actual shared memory needed
+    size_t shared_mem = 2 * threads * element_size;
+    
+    return LaunchConfig(threads, blocks, shared_mem);
 }
 
 // =============================================================================
@@ -517,13 +586,25 @@ inline LaunchConfig get_reduction_launch_config(int work_size, int element_size 
  */
 inline LaunchConfig get_msm_launch_config(int work_size, KernelType kernel_type) {
     const auto& gpu = GPUConfig::get();
+    
+    // Guard against invalid work_size
+    if (work_size <= 0) {
+        return LaunchConfig(gpu.warp_size, 1, 0, false);
+    }
+    
     int threads = gpu.get_optimal_threads(kernel_type);
-    int natural_blocks = (work_size + threads - 1) / threads;
+    
+    // Use int64_t to prevent overflow for large work sizes
+    int64_t natural_blocks64 = (static_cast<int64_t>(work_size) + threads - 1) / threads;
+    constexpr int MAX_BLOCKS = 1 << 20;  // Practical limit
+    int natural_blocks = static_cast<int>(std::min(natural_blocks64, static_cast<int64_t>(MAX_BLOCKS)));
+    
     int min_blocks = gpu.min_blocks_for_full_occupancy;
     
     // Use persistent threads for small workloads
     bool use_persistent = (natural_blocks < min_blocks) && (work_size < 8192);
     int blocks = use_persistent ? min_blocks : natural_blocks;
+    blocks = std::max(blocks, 1);  // At least one block
     
     return LaunchConfig(threads, blocks, 0, use_persistent);
 }
@@ -541,6 +622,11 @@ inline LaunchConfig get_msm_launch_config(int work_size, KernelType kernel_type)
  */
 inline LaunchConfig get_msm_cooperative_config(int total_buckets, int threads_per_bucket, int element_size) {
     const auto& gpu = GPUConfig::get();
+    
+    // Guard against invalid inputs
+    if (total_buckets <= 0) return LaunchConfig(GPUConfig::DEFAULT_THREADS_PER_BUCKET, 1, 0);
+    if (threads_per_bucket <= 0) threads_per_bucket = GPUConfig::DEFAULT_THREADS_PER_BUCKET;
+    if (element_size <= 0) element_size = GPUConfig::G1_PROJECTIVE_SIZE;
     
     // Get threads that divide evenly by threads_per_bucket
     int threads = gpu.get_cooperative_threads(threads_per_bucket);
@@ -573,16 +659,21 @@ inline LaunchConfig get_msm_cooperative_config(int total_buckets, int threads_pe
 inline LaunchConfig get_msm_reduction_config(int num_windows, int num_buckets, int element_size) {
     const auto& gpu = GPUConfig::get();
     
+    // Guard against invalid inputs
+    if (num_windows <= 0) return LaunchConfig(gpu.warp_size, 1, 0);
+    if (num_buckets <= 0) num_buckets = GPUConfig::MSM_MULTITHREAD_THRESHOLD;
+    if (element_size <= 0) element_size = GPUConfig::G1_PROJECTIVE_SIZE;
+    
     int optimal = gpu.get_optimal_threads(KernelType::BUCKET_REDUCE);
     
-    if (num_buckets >= 256) {
+    if (num_buckets >= GPUConfig::MSM_MULTITHREAD_THRESHOLD) {
         // Multi-threaded: one block per window
         // Need 2 arrays for reduction: shared_mem = 2 * threads * element_size
         // Max threads = shared_mem_per_block / (2 * element_size)
         int max_threads_by_shared = gpu.shared_mem_per_block / (2 * element_size);
         max_threads_by_shared = (max_threads_by_shared / gpu.warp_size) * gpu.warp_size;  // Round to warp
         
-        int threads = std::min({256, optimal, max_threads_by_shared});
+        int threads = std::min({GPUConfig::DEFAULT_COMPUTE_THREADS, optimal, max_threads_by_shared});
         threads = std::max(threads, gpu.warp_size);  // At least one warp
         
         size_t shared_mem = 2 * threads * element_size;
@@ -653,11 +744,8 @@ struct NTTLaunchConfig {
 inline NTTLaunchConfig get_ntt_launch_config(int ntt_size, int element_size = GPUConfig::FR_SIZE) {
     const auto& gpu = GPUConfig::get();
     
-    // Threshold for shared memory approach
-    constexpr int SHARED_MEM_THRESHOLD = 256;
-    
     size_t required_shared = ntt_size * element_size;
-    bool can_use_shared = (ntt_size <= SHARED_MEM_THRESHOLD) && 
+    bool can_use_shared = (ntt_size <= GPUConfig::NTT_SHARED_MEM_THRESHOLD) && 
                           (required_shared <= static_cast<size_t>(gpu.shared_mem_per_block));
     
     if (can_use_shared) {
