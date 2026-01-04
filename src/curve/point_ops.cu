@@ -100,50 +100,6 @@ void batch_projective_to_affine_g1(
     );
 }
 
-/**
- * @brief Batch point addition
- */
-__global__ void batch_add_g1_kernel(
-    G1Projective* output,
-    const G1Projective* lhs,
-    const G1Projective* rhs,
-    int size
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    
-    g1_add(output[idx], lhs[idx], rhs[idx]);
-}
-
-/**
- * @brief Batch point doubling
- */
-__global__ void batch_double_g1_kernel(
-    G1Projective* output,
-    const G1Projective* input,
-    int size
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    
-    g1_double(output[idx], input[idx]);
-}
-
-/**
- * @brief Batch point negation
- */
-__global__ void batch_negate_g1_kernel(
-    G1Projective* output,
-    const G1Projective* input,
-    int size
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    
-    G1Projective p = input[idx];
-    g1_neg(output[idx], p);
-}
-
 #ifdef GLV_ENABLED
 // =============================================================================
 // GLV Endomorphism Constants for BLS12-381 (EXPERIMENTAL)
@@ -744,20 +700,6 @@ __device__ __forceinline__ void g2_add_mixed(G2Projective& r, const G2Projective
     // Z3 = (Z1 + h)^2 - Z1Z1 - hh
     Fq2 z_plus_h = p.Z + h;
     r.Z = z_plus_h * z_plus_h - z1z1 - hh;
-}
-
-/**
- * @brief Batch G2 operations
- */
-__global__ void batch_affine_to_projective_g2_kernel(
-    G2Projective* output,
-    const G2Affine* input,
-    int size
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-    
-    output[idx] = G2Projective::from_affine(input[idx]);
 }
 
 /**

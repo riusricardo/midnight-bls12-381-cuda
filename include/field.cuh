@@ -888,28 +888,6 @@ __device__ __forceinline__ Field<Config> field_inv(const Field<Config>& a) {
     return result;
 }
 
-/**
- * @brief Checked field inversion - returns false on zero input
- * 
- * Use this variant when you need to handle the zero case explicitly
- * rather than silently returning zero or trapping.
- * 
- * @param result Output: the inverse of a (valid only if return is true)
- * @param a Input field element to invert
- * @return true if inversion succeeded, false if a was zero
- */
-template<typename Config>
-__device__ __forceinline__ bool field_inv_checked(
-    Field<Config>& result,
-    const Field<Config>& a
-) {
-    if (a.is_zero()) {
-        return false;
-    }
-    field_inv(result, a);
-    return true;
-}
-
 // =============================================================================
 // Operator overloads for cleaner syntax
 // =============================================================================

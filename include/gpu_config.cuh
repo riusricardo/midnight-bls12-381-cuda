@@ -28,8 +28,10 @@
  * This header is designed to be included by:
  * - msm.cuh (MSM operations)
  * - ntt.cuh (NTT operations)
+ * - msm_kernels.cu (MSM kernel implementations)
  * - ntt_kernels.cu (NTT kernel implementations)
  * - vec_ops.cu (vector operations)
+ * - point_ops.cu (points operations)
  * - Any other CUDA code needing GPU-aware tuning
  */
 

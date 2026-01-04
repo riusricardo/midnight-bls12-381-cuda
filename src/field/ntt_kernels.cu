@@ -37,7 +37,7 @@
  *    - ntt_shared_memory_kernel: Optimized for small sizes (≤256)
  *    - intt_shared_memory_kernel: Inverse version of above
  *    - ntt_butterfly_fused_2stage_kernel: Fused 2-stage for larger sizes
- *    - ntt_radix4_kernel: True Radix-4 butterfly (alternative optimization)
+
  * 
  * 2. Domain Management:
  *    - Static storage for Domain<Fr> instances
@@ -699,72 +699,6 @@ __global__ void intt_butterfly_kernel(
     
     data[i0] = u + v;
     data[i1] = (u - v) * omega_inv;
-}
-
-/**
- * @brief Radix-4 butterfly kernel for mixed-radix NTT
- * 
- * Processes 4 elements using the Radix-4 DFT matrix, which combines
- * 2 stages of Radix-2 butterflies mathematically.
- * 
- * Radix-4 DFT: [1  1  1  1 ]   [a0]
- *              [1 -i -1  i ] * [a1]
- *              [1 -1  1 -1 ]   [a2]
- *              [1  i -1 -i ]   [a3]
- * 
- * @param data Input/output array
- * @param twiddles Precomputed twiddle factors (includes imaginary unit at size/4)
- * @param size Total NTT size
- * @param stride Stride between elements in a Radix-4 group
- */
-__global__ void ntt_radix4_kernel(
-    Fr* data,
-    const Fr* twiddles,
-    int size,
-    int stride
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int num_groups = size / 4;
-    
-    if (idx >= num_groups) return;
-    
-    int group = idx / stride;
-    int pos = idx % stride;
-    
-    int base = group * stride * 4 + pos;
-    
-    // Load 4 elements
-    Fr a0 = data[base];
-    Fr a1 = data[base + stride];
-    Fr a2 = data[base + 2 * stride];
-    Fr a3 = data[base + 3 * stride];
-    
-    // Twiddle factors
-    int tw_stride = size / (4 * stride);
-    Fr w1 = twiddles[pos * tw_stride];
-    Fr w2 = twiddles[2 * pos * tw_stride];
-    Fr w3 = twiddles[3 * pos * tw_stride];
-    
-    // Apply twiddles to a1, a2, a3
-    a1 = a1 * w1;
-    a2 = a2 * w2;
-    a3 = a3 * w3;
-    
-    // Radix-4 butterfly (standard form)
-    Fr b0 = a0 + a2;
-    Fr b1 = a0 - a2;
-    Fr b2 = a1 + a3;
-    Fr b3 = a1 - a3;
-    
-    // Get i = omega^(n/4), the 4th root of unity
-    Fr i_val = twiddles[size / 4];
-    b3 = b3 * i_val;
-    
-    // Final combination
-    data[base] = b0 + b2;
-    data[base + stride] = b1 + b3;
-    data[base + 2 * stride] = b0 - b2;
-    data[base + 3 * stride] = b1 - b3;
 }
 
 /**
