@@ -780,81 +780,79 @@ cudaError_t msm_cuda(
         MSM_CUDA_CHECK(cudaFree(d_temp_storage));
     }
     
-    // 5. Bucket accumulation
+    // 5. Bucket accumulation - select optimal strategy based on bucket density
     {
-        constexpr int THREADS_PER_BUCKET = 8;
-        int threads = GPUConfig::get().get_cooperative_threads(THREADS_PER_BUCKET);
+        // Strategy selection based on avg points per bucket analysis:
+        // - SERIAL: avg < 8, cooperative overhead exceeds benefit
+        // - COOPERATIVE_8: avg 8-31, moderate parallelism benefit
+        // - COOPERATIVE_16: avg >= 32, high parallelism benefit
+        auto strategy = get_msm_accumulate_strategy(num_contributions, total_buckets);
         
-        if (should_use_cooperative_accumulate(msm_size, total_buckets, threads)) {
-            auto cfg = get_msm_cooperative_config(total_buckets, THREADS_PER_BUCKET, sizeof(P));
-            accumulate_cooperative_kernel<A, P, THREADS_PER_BUCKET><<<cfg.blocks, cfg.threads, cfg.shared_mem, stream>>>(
-                d_buckets,
-                d_packed_indices_sorted,
-                d_bases,
-                d_bucket_offsets,
-                d_bucket_sizes,
-                total_buckets
-            );
-        } else {
-            auto cfg = get_launch_config(total_buckets, KernelType::BUCKET_REDUCE);
-            accumulate_sorted_kernel<A, P><<<cfg.blocks, cfg.threads, 0, stream>>>(
-                d_buckets,
-                d_packed_indices_sorted,
-                d_bases,
-                d_bucket_offsets,
-                d_bucket_sizes,
-                total_buckets
-            );
+        switch (strategy) {
+            case MSMAccumulateStrategy::COOPERATIVE_16: {
+                constexpr int TPB = GPUConfig::MSM_THREADS_PER_BUCKET_LARGE;
+                auto cfg = get_msm_cooperative_config(total_buckets, TPB, sizeof(P));
+                accumulate_cooperative_kernel<A, P, TPB><<<cfg.blocks, cfg.threads, cfg.shared_mem, stream>>>(
+                    d_buckets, d_packed_indices_sorted, d_bases,
+                    d_bucket_offsets, d_bucket_sizes, total_buckets
+                );
+                break;
+            }
+            case MSMAccumulateStrategy::COOPERATIVE_8: {
+                constexpr int TPB = GPUConfig::MSM_THREADS_PER_BUCKET_SMALL;
+                auto cfg = get_msm_cooperative_config(total_buckets, TPB, sizeof(P));
+                accumulate_cooperative_kernel<A, P, TPB><<<cfg.blocks, cfg.threads, cfg.shared_mem, stream>>>(
+                    d_buckets, d_packed_indices_sorted, d_bases,
+                    d_bucket_offsets, d_bucket_sizes, total_buckets
+                );
+                break;
+            }
+            case MSMAccumulateStrategy::SERIAL:
+            default: {
+                auto cfg = get_launch_config(total_buckets, KernelType::BUCKET_REDUCE);
+                accumulate_sorted_kernel<A, P><<<cfg.blocks, cfg.threads, 0, stream>>>(
+                    d_buckets, d_packed_indices_sorted, d_bases,
+                    d_bucket_offsets, d_bucket_sizes, total_buckets
+                );
+                break;
+            }
         }
         MSM_CUDA_CHECK(cudaGetLastError());
     }
     
-    // 6. Bucket reduction
+    // 6. Bucket reduction - use multithread for large bucket counts
     {
         auto cfg = get_msm_reduction_config(num_windows, num_buckets, sizeof(P));
         
-        if (num_buckets >= 256) {
+        if (num_buckets >= GPUConfig::MSM_BUCKET_REDUCTION_MULTITHREAD_THRESHOLD) {
             parallel_bucket_reduction_multithread_kernel<P><<<cfg.blocks, cfg.threads, cfg.shared_mem, stream>>>(
-                d_window_results,
-                d_buckets,
-                num_windows,
-                num_buckets,
-                num_buckets + 1
+                d_window_results, d_buckets, num_windows, num_buckets, num_buckets + 1
             );
         } else {
             parallel_bucket_reduction_kernel<P><<<cfg.blocks, cfg.threads, 0, stream>>>(
-                d_window_results,
-                d_buckets,
-                num_windows,
-                num_buckets,
-                num_buckets + 1
+                d_window_results, d_buckets, num_windows, num_buckets, num_buckets + 1
             );
         }
         MSM_CUDA_CHECK(cudaGetLastError());
     }
     
-    // 7. Final accumulation
+    // 7. Final accumulation - use parallel for multiple windows
     {
-        if (num_windows >= 4) {
-            int threads = 32;
+        if (num_windows >= GPUConfig::MSM_FINAL_ACCUMULATION_PARALLEL_THRESHOLD) {
+            // Calculate optimal thread count (next power of 2, clamped)
+            int threads = GPUConfig::MSM_FINAL_ACCUMULATION_MIN_THREADS;
             while (threads < num_windows) threads *= 2;
-            if (threads > 256) threads = 256;
+            threads = std::min(threads, GPUConfig::MSM_FINAL_ACCUMULATION_MAX_THREADS);
             
             // Shared memory: one P element per window for tree reduction
             size_t shared_mem = num_windows * sizeof(P);
             
             final_accumulation_parallel_kernel<P><<<1, threads, shared_mem, stream>>>(
-                d_result,
-                d_window_results,
-                num_windows,
-                c
+                d_result, d_window_results, num_windows, c
             );
         } else {
             final_accumulation_kernel<P><<<1, 1, 0, stream>>>(
-                d_result,
-                d_window_results,
-                num_windows,
-                c
+                d_result, d_window_results, num_windows, c
             );
         }
         MSM_CUDA_CHECK(cudaGetLastError());

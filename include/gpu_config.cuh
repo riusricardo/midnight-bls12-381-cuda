@@ -157,6 +157,29 @@ struct GPUConfig {
     static constexpr int DEFAULT_THREADS_PER_BUCKET = 8;   // Cooperative threads per bucket
     static constexpr int MSM_MULTITHREAD_THRESHOLD = 256;  // Bucket count threshold for multithread
     
+    // MSM Accumulation Kernel Selection Thresholds
+    // Based on profiling: cooperative kernel has overhead (shared mem, reduction)
+    // Only beneficial when avg_points_per_bucket >= threads_per_bucket
+    static constexpr int MSM_THREADS_PER_BUCKET_SMALL = 8;   // For moderate bucket density
+    static constexpr int MSM_THREADS_PER_BUCKET_LARGE = 16;  // For high bucket density
+    
+    // Minimum avg points per bucket to justify cooperative kernel overhead
+    // If avg < threshold, serial kernel is faster despite lower SM utilization
+    static constexpr int MSM_COOPERATIVE_MIN_AVG_SMALL = 8;   // Threshold for 8 threads/bucket
+    static constexpr int MSM_COOPERATIVE_MIN_AVG_LARGE = 32;  // Threshold for 16 threads/bucket
+    
+    // MSM Bucket Reduction Thresholds
+    // Multithread reduction uses one block per window with parallel scan
+    // Serial reduction uses one thread per window (simpler, less overhead)
+    static constexpr int MSM_BUCKET_REDUCTION_MULTITHREAD_THRESHOLD = 256;  // Use multithread if buckets >= this
+    
+    // MSM Final Accumulation Thresholds
+    // Parallel final accumulation uses tree reduction in shared memory
+    // Sequential is simpler and faster for very few windows
+    static constexpr int MSM_FINAL_ACCUMULATION_PARALLEL_THRESHOLD = 4;  // Use parallel if windows >= this
+    static constexpr int MSM_FINAL_ACCUMULATION_MIN_THREADS = 32;         // Minimum threads for parallel
+    static constexpr int MSM_FINAL_ACCUMULATION_MAX_THREADS = 256;        // Maximum threads for parallel
+    
     // =========================================================================
     // Thread Configuration Constants
     // =========================================================================
@@ -697,22 +720,38 @@ inline LaunchConfig get_msm_reduction_config(int num_windows, int num_buckets, i
 }
 
 /**
- * @brief Decide if cooperative kernel should be used for MSM accumulate
- * 
- * @param msm_size Number of scalars
- * @param total_buckets Total buckets across all windows
- * @param threads Thread count to use
- * @return True if cooperative kernel should be used
+ * @brief MSM accumulation strategy based on bucket density analysis
  */
-inline bool should_use_cooperative_accumulate(int msm_size, int total_buckets, int threads) {
-    const auto& gpu = GPUConfig::get();
-    int standard_blocks = (total_buckets + threads - 1) / threads;
-    int min_blocks = gpu.min_blocks_for_full_occupancy;
+enum class MSMAccumulateStrategy {
+    SERIAL,           // One thread per bucket - best for sparse buckets
+    COOPERATIVE_8,    // 8 threads per bucket - moderate density (avg >= 8)
+    COOPERATIVE_16    // 16 threads per bucket - high density (avg >= 32)
+};
+
+/**
+ * @brief Determine optimal MSM accumulation strategy based on points-per-bucket ratio
+ * 
+ * Analysis shows:
+ * - avg < 8:  Serial is faster (cooperative overhead exceeds benefit)
+ * - avg 8-31: Cooperative with 8 threads (1-4x work per thread)
+ * - avg >= 32: Cooperative with 16 threads (2x+ work per thread)
+ * 
+ * @param num_contributions Total point contributions (msm_size * num_windows)
+ * @param total_buckets Total buckets across all windows
+ * @return Optimal accumulation strategy
+ */
+inline MSMAccumulateStrategy get_msm_accumulate_strategy(int num_contributions, int total_buckets) {
+    if (total_buckets <= 0) return MSMAccumulateStrategy::SERIAL;
     
-    // Use cooperative if:
-    // 1. MSM size is small (≤4096) - higher point density per bucket
-    // 2. OR standard kernel would underutilize GPU
-    return (msm_size <= 4096) || (standard_blocks < min_blocks);
+    int avg_points_per_bucket = num_contributions / total_buckets;
+    
+    if (avg_points_per_bucket >= GPUConfig::MSM_COOPERATIVE_MIN_AVG_LARGE) {
+        return MSMAccumulateStrategy::COOPERATIVE_16;
+    } else if (avg_points_per_bucket >= GPUConfig::MSM_COOPERATIVE_MIN_AVG_SMALL) {
+        return MSMAccumulateStrategy::COOPERATIVE_8;
+    } else {
+        return MSMAccumulateStrategy::SERIAL;
+    }
 }
 
 // =============================================================================
