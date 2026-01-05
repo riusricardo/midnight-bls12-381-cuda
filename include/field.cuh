@@ -344,7 +344,7 @@ using scalar_t = Fr;
 /**
  * @brief Constant-time conditional selection: result = cond ? a : b
  * 
- * SECURITY: This function executes in constant time regardless of the value
+ * This function executes in constant time regardless of the value
  * of `cond`. It prevents timing side-channels by avoiding branches.
  * 
  * @param result Output field element
@@ -377,6 +377,10 @@ __device__ __forceinline__ void field_cmov(
 
 /**
  * @brief Add two field elements: result = a + b mod p
+ * 
+ * This function is constant-time. Both the unreduced and
+ * reduced results are always computed, and the final selection uses
+ * field_cmov to avoid data-dependent branches.
  */
 template<typename Config>
 __device__ __forceinline__ void field_add(
@@ -418,17 +422,25 @@ __device__ __forceinline__ void field_add(
         borrow = new_borrow;
     }
     
-    // Select result based on whether subtraction underflowed
-    bool use_reduced = (carry != 0) || (borrow == 0);
-    
+    // Constant-time selection using field_cmov
+    // Select reduced if carry set or no borrow (result >= modulus)
+    Field<Config> temp_field, reduced_field;
     UNROLL_LOOP
     for (int i = 0; i < LIMBS; i++) {
-        result.limbs[i] = use_reduced ? reduced[i] : temp[i];
+        temp_field.limbs[i] = temp[i];
+        reduced_field.limbs[i] = reduced[i];
     }
+    
+    int use_reduced = ((carry != 0) || (borrow == 0)) ? 1 : 0;
+    field_cmov(result, reduced_field, temp_field, use_reduced);
 }
 
 /**
  * @brief Subtract two field elements: result = a - b mod p
+ * 
+ * This function is constant-time. Both the uncorrected and
+ * corrected results are always computed, and the final selection uses
+ * field_cmov to avoid data-dependent branches.
  */
 template<typename Config>
 __device__ __forceinline__ void field_sub(
@@ -454,26 +466,33 @@ __device__ __forceinline__ void field_sub(
         borrow = new_borrow;
     }
     
-    // If borrow, add modulus
-    if (borrow) {
-        uint64_t carry = 0;
-        UNROLL_LOOP
-        for (int i = 0; i < LIMBS; i++) {
-            uint64_t t = temp[i];
-            uint64_t mod_i = Config::modulus(i);
-            uint64_t sum = t + mod_i;
-            uint64_t new_carry = (sum < t) ? 1ULL : 0ULL;
-            sum += carry;
-            new_carry += (sum < carry) ? 1ULL : 0ULL;
-            temp[i] = sum;
-            carry = new_carry;
-        }
-    }
-    
+    // Always compute corrected version (add modulus)
+    // This ensures constant-time execution regardless of borrow value
+    uint64_t corrected[LIMBS];
+    uint64_t carry = 0;
     UNROLL_LOOP
     for (int i = 0; i < LIMBS; i++) {
-        result.limbs[i] = temp[i];
+        uint64_t t = temp[i];
+        uint64_t mod_i = Config::modulus(i);
+        uint64_t sum = t + mod_i;
+        uint64_t new_carry = (sum < t) ? 1ULL : 0ULL;
+        sum += carry;
+        new_carry += (sum < carry) ? 1ULL : 0ULL;
+        corrected[i] = sum;
+        carry = new_carry;
     }
+    
+    // Constant-time selection using field_cmov
+    // Select corrected if borrow occurred, else use temp
+    Field<Config> temp_field, corrected_field;
+    UNROLL_LOOP
+    for (int i = 0; i < LIMBS; i++) {
+        temp_field.limbs[i] = temp[i];
+        corrected_field.limbs[i] = corrected[i];
+    }
+    
+    int needs_correction = (borrow != 0) ? 1 : 0;
+    field_cmov(result, corrected_field, temp_field, needs_correction);
 }
 
 /**
@@ -481,6 +500,8 @@ __device__ __forceinline__ void field_sub(
  * 
  * Uses the CIOS (Coarsely Integrated Operand Scanning) algorithm
  * optimized for GPU execution.
+ * 
+ * Final reduction uses field_cmov for constant-time selection.
  */
 template<typename Config>
 __device__ __forceinline__ void field_mul(
@@ -538,12 +559,17 @@ __device__ __forceinline__ void field_mul(
         reduced[i] = diff;
     }
     
-    bool use_reduced = (t[LIMBS] != 0) || (borrow == 0);
-    
+    // Constant-time selection using field_cmov
+    // Select reduced if overflow or no borrow (result >= modulus)
+    Field<Config> unreduced_field, reduced_field;
     UNROLL_LOOP
     for (int i = 0; i < LIMBS; i++) {
-        result.limbs[i] = use_reduced ? reduced[i] : t[i];
+        unreduced_field.limbs[i] = t[i];
+        reduced_field.limbs[i] = reduced[i];
     }
+    
+    int use_reduced = ((t[LIMBS] != 0) || (borrow == 0)) ? 1 : 0;
+    field_cmov(result, reduced_field, unreduced_field, use_reduced);
 }
 
 /**
@@ -551,6 +577,8 @@ __device__ __forceinline__ void field_mul(
  * 
  * Optimized squaring exploiting a[i]*a[j] = a[j]*a[i] symmetry.
  * Saves ~40% compared to general multiplication.
+ * 
+ * Final reduction uses field_cmov for constant-time selection.
  */
 template<typename Config>
 __device__ __forceinline__ void field_sqr(
@@ -640,48 +668,80 @@ __device__ __forceinline__ void field_sqr(
         borrow = new_borrow;
     }
     
-    bool use_reduced = (borrow == 0);
-    
+    // Constant-time selection using field_cmov
+    // Select reduced if no borrow (result >= modulus)
+    Field<Config> unreduced_field, reduced_field;
     UNROLL_LOOP
     for (int i = 0; i < LIMBS; i++) {
-        result.limbs[i] = use_reduced ? reduced[i] : t[i + LIMBS];
+        unreduced_field.limbs[i] = t[i + LIMBS];
+        reduced_field.limbs[i] = reduced[i];
     }
+    
+    int use_reduced = (borrow == 0) ? 1 : 0;
+    field_cmov(result, reduced_field, unreduced_field, use_reduced);
 }
 
 /**
  * @brief Negate field element: result = -a mod p
+ * 
+ * This function is constant-time. The negation is always
+ * computed, and a constant-time selection chooses between the negated
+ * value and zero based on whether the input was zero.
  */
 template<typename Config>
 __device__ __forceinline__ void field_neg(
     Field<Config>& result,
     const Field<Config>& a
 ) {
-    if (a.is_zero()) {
-        result = a;
-        return;
-    }
-    
     constexpr int LIMBS = Config::LIMBS;
     
+    // Always compute negation (p - a)
+    Field<Config> negated;
     uint64_t borrow = 0;
     UNROLL_LOOP
     for (int i = 0; i < LIMBS; i++) {
         uint64_t mod_i = Config::modulus(i);
-        uint64_t diff = mod_i - a.limbs[i] - borrow;
-        borrow = (mod_i < a.limbs[i] + borrow) ? 1 : 0;
-        result.limbs[i] = diff;
+        uint64_t ai = a.limbs[i];
+        // Compute mod_i - ai - borrow carefully to avoid overflow issues
+        uint64_t diff = mod_i - ai;
+        uint64_t new_borrow = (mod_i < ai) ? 1ULL : 0ULL;
+        uint64_t diff2 = diff - borrow;
+        new_borrow += (diff < borrow) ? 1ULL : 0ULL;
+        negated.limbs[i] = diff2;
+        borrow = new_borrow;
     }
+    
+    // Constant-time check if input is zero
+    // Accumulate OR of all limbs (constant-time, no early exit)
+    uint64_t nonzero_acc = 0;
+    UNROLL_LOOP
+    for (int i = 0; i < LIMBS; i++) {
+        nonzero_acc |= a.limbs[i];
+    }
+    
+    // If input is zero, result should be zero; otherwise result is negated
+    // is_zero = 1 if a == 0, else 0
+    int is_zero = (nonzero_acc == 0) ? 1 : 0;
+    
+    // Constant-time selection using field_cmov
+    // result = is_zero ? a : negated  (where a is zero if is_zero is true)
+    field_cmov(result, a, negated, is_zero);
 }
 
 /**
- * @brief Modular inversion using optimized addition chain
+ * @brief Modular inversion using constant-time exponentiation
  * 
- * Uses a combination of squarings and multiplications that's more efficient
- * than the basic binary method. For Fr (BLS12-381 scalar field), this
- * achieves inversion in ~300 operations vs ~380 for naive Fermat.
+ * Computes a^(-1) mod p using Fermat's little theorem: a^(-1) = a^(p-2) mod p.
  * 
- * The exponent is p-2, and we use addition chains optimized for the 
- * specific structure of the BLS12-381 primes.
+ * This function is constant-time with respect to the input value.
+ * All operations are performed regardless of the input, and selection between
+ * results uses bitwise masking to avoid timing side-channels.
+ * 
+ * For 4-limb fields (Fr), uses windowed exponentiation with window size 4.
+ * For 6-limb fields (Fq), uses constant-time binary exponentiation.
+ * 
+ * Note: The exponent (p-2) is public, so the number of iterations is fixed.
+ * The security requirement is that timing does not depend on the INPUT value.
  */
 template<typename Config>
 __device__ void field_inv(
@@ -690,64 +750,22 @@ __device__ void field_inv(
 ) {
     constexpr int LIMBS = Config::LIMBS;
     
-    if (a.is_zero()) {
-        #ifdef ICICLE_DEBUG
-        printf("CRITICAL ERROR: field_inv called with zero input!\n");
-        __trap();  // Abort kernel for immediate debugging
-        #endif
-        result = Field<Config>::zero();
-        return;
+    // Check for zero input in constant-time
+    // (accumulate OR of all limbs, no early exit)
+    uint64_t nonzero_acc = 0;
+    UNROLL_LOOP
+    for (int i = 0; i < LIMBS; i++) {
+        nonzero_acc |= a.limbs[i];
     }
+    int input_is_zero = (nonzero_acc == 0) ? 1 : 0;
     
-    // For 4-limb fields (Fr), use optimized addition chain
-    // For 6-limb fields (Fq), use binary method (still correct, just slower)
+    // We still compute the inversion even for zero input (constant-time)
+    // and select zero result at the end if input was zero
     
-    if constexpr (LIMBS == 4) {
-        // Optimized addition chain for Fr inverse
-        // p-2 = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfefffffffeffffffff
-        // 
-        // We build up powers using: x^2, x^3, x^5, x^9, etc.
-        // Then combine with strategic squarings
-        
-        Field<Config> x = a;
-        Field<Config> x2, x3, x4, x5, x6, x7, x8, x9, x11, x13, x15;
-        Field<Config> t, acc;
-        
-        // Build small powers
-        field_sqr(x2, x);           // x^2
-        field_mul(x3, x2, x);       // x^3
-        field_sqr(x4, x2);          // x^4
-        field_mul(x5, x4, x);       // x^5
-        field_sqr(x6, x3);          // x^6
-        field_mul(x7, x6, x);       // x^7
-        field_sqr(x8, x4);          // x^8
-        field_mul(x9, x8, x);       // x^9
-        field_mul(x11, x9, x2);     // x^11
-        field_mul(x13, x11, x2);    // x^13
-        field_mul(x15, x13, x2);    // x^15
-        
-        // Now compute x^(p-2) using the binary expansion
-        // p-2 for Fr has a specific pattern we can exploit
-        
-        // Build up the exponent through repeated squaring and multiplication
-        // This follows the bit pattern of p-2
-        
-        // Start with x^1
-        acc = x;
-        
-        // Process high bits of the exponent
-        // 0x73eda753299d7d48 (high 64 bits)
-        
-        // Square to shift, multiply to add 1 bits
-        // We'll use a sliding window approach for efficiency
-        
-        // Actually, fall back to binary method with our optimized squaring
-        // This is still faster due to optimized field_sqr
-        
-        // Compute exponent = p - 2
-        uint64_t exp[LIMBS];
+    // Compute exponent = p - 2
+    uint64_t exp[LIMBS];
+    {
         uint64_t borrow = 0;
-        
         uint64_t mod_0 = Config::modulus(0);
         exp[0] = mod_0 - 2;
         borrow = (mod_0 < 2) ? 1 : 0;
@@ -758,82 +776,124 @@ __device__ void field_inv(
             exp[i] = mod_i - borrow;
             borrow = (mod_i < borrow) ? 1 : 0;
         }
+    }
+    
+    if constexpr (LIMBS == 4) {
+        // =====================================================================
+        // CONSTANT-TIME Windowed Exponentiation for Fr (4 limbs)
+        // =====================================================================
+        // Uses window size 4: precompute a^1, a^2, ..., a^15
+        // Then process exponent in 4-bit windows
         
-        // Windowed exponentiation with window size 4
-        // Precompute: x^1, x^2, ..., x^15 (already have these)
+        Field<Config> x = a;
+        
+        // Build power table: powers[i] = a^i for i in [0, 15]
         Field<Config> powers[16];
         powers[0] = Field<Config>::one();
         powers[1] = x;
-        powers[2] = x2;
-        powers[3] = x3;
-        powers[4] = x4;
-        powers[5] = x5;
-        powers[6] = x6;
-        powers[7] = x7;
-        powers[8] = x8;
-        powers[9] = x9;
-        field_mul(powers[10], x9, x);
-        powers[11] = x11;
-        field_mul(powers[12], x11, x);
-        powers[13] = x13;
-        field_mul(powers[14], x13, x);
-        powers[15] = x15;
         
-        // Process exponent in 4-bit windows from high to low
-        bool started = false;
-        acc = Field<Config>::one();
+        // Compute powers 2-15 using squaring and multiplication
+        field_sqr(powers[2], x);                    // x^2
+        field_mul(powers[3], powers[2], x);         // x^3
+        field_sqr(powers[4], powers[2]);            // x^4
+        field_mul(powers[5], powers[4], x);         // x^5
+        field_sqr(powers[6], powers[3]);            // x^6
+        field_mul(powers[7], powers[6], x);         // x^7
+        field_sqr(powers[8], powers[4]);            // x^8
+        field_mul(powers[9], powers[8], x);         // x^9
+        field_mul(powers[10], powers[9], x);        // x^10
+        field_mul(powers[11], powers[10], x);       // x^11
+        field_mul(powers[12], powers[11], x);       // x^12
+        field_mul(powers[13], powers[12], x);       // x^13
+        field_mul(powers[14], powers[13], x);       // x^14
+        field_mul(powers[15], powers[14], x);       // x^15
+        
+        // Constant-time windowed exponentiation
+        // Process all windows, always perform operations, use cmov for selection
+        
+        Field<Config> acc = Field<Config>::one();
+        
+        // For p-2 in Fr, the highest nibble of the highest limb is known
+        // We can find the first non-zero nibble position at compile time
+        // For Fr: p-2 = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfefffffffeffffffff
+        // Highest limb is 0x73eda753299d7d48, highest nibble is 0x7
+        
+        // Process all 64 nibbles (16 nibbles per limb * 4 limbs)
+        // The first few operations are effectively multiplying by 1, which is fine
         
         for (int limb = LIMBS - 1; limb >= 0; limb--) {
             for (int nibble = 15; nibble >= 0; nibble--) {
+                // Always perform 4 squarings
+                field_sqr(acc, acc);
+                field_sqr(acc, acc);
+                field_sqr(acc, acc);
+                field_sqr(acc, acc);
+                
+                // Get current window value
                 int window = (exp[limb] >> (nibble * 4)) & 0xF;
                 
-                if (started) {
-                    // Square 4 times
-                    field_sqr(acc, acc);
-                    field_sqr(acc, acc);
-                    field_sqr(acc, acc);
-                    field_sqr(acc, acc);
+                // Constant-time table lookup using sequential cmov
+                // This is O(16) per window, but guarantees constant-time
+                Field<Config> power_to_use = powers[0];  // Default to 1
+                
+                UNROLL_LOOP
+                for (int i = 1; i < 16; i++) {
+                    int is_match = (window == i) ? 1 : 0;
+                    field_cmov(power_to_use, powers[i], power_to_use, is_match);
                 }
                 
-                if (window != 0) {
-                    if (started) {
-                        field_mul(acc, acc, powers[window]);
-                    } else {
-                        acc = powers[window];
-                        started = true;
-                    }
-                }
+                // Always perform multiplication
+                Field<Config> multiplied;
+                field_mul(multiplied, acc, power_to_use);
+                
+                // Select multiplied result if window != 0, else keep acc
+                // Note: multiplying by powers[0] = 1 gives acc, so this is safe
+                // But we use explicit cmov for clarity and guaranteed constant-time
+                int window_nonzero = (window != 0) ? 1 : 0;
+                field_cmov(acc, multiplied, acc, window_nonzero);
             }
         }
         
         result = acc;
+        
     } else {
-        // General case: binary method (for Fq with 6 limbs)
-        uint64_t exp[LIMBS];
-        uint64_t borrow = 0;
-        
-        uint64_t mod_0 = Config::modulus(0);
-        exp[0] = mod_0 - 2;
-        borrow = (mod_0 < 2) ? 1 : 0;
-        
-        for (int i = 1; i < LIMBS; i++) {
-            uint64_t mod_i = Config::modulus(i);
-            exp[i] = mod_i - borrow;
-            borrow = (mod_i < borrow) ? 1 : 0;
-        }
+        // =====================================================================
+        // CONSTANT-TIME Binary Exponentiation for Fq (6 limbs)
+        // =====================================================================
+        // Process each bit, always perform both multiply and square
         
         Field<Config> base = a;
-        result = Field<Config>::one();
+        Field<Config> acc = Field<Config>::one();
         
         for (int i = 0; i < LIMBS; i++) {
             for (int bit = 0; bit < 64; bit++) {
-                if ((exp[i] >> bit) & 1) {
-                    field_mul(result, result, base);
-                }
+                // Get current bit
+                int exp_bit = (exp[i] >> bit) & 1;
+                
+                // Always compute the multiplication
+                Field<Config> multiplied;
+                field_mul(multiplied, acc, base);
+                
+                // Constant-time selection based on exponent bit
+                field_cmov(acc, multiplied, acc, exp_bit);
+                
+                // Always square the base
                 field_sqr(base, base);
             }
         }
+        
+        result = acc;
     }
+    
+    // If input was zero, return zero (constant-time selection)
+    Field<Config> zero_result = Field<Config>::zero();
+    field_cmov(result, zero_result, result, input_is_zero);
+    
+    #ifdef ICICLE_DEBUG
+    if (input_is_zero) {
+        printf("WARNING: field_inv called with zero input, returning zero\n");
+    }
+    #endif
 }
 
 /**
