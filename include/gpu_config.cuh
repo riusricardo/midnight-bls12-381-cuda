@@ -653,6 +653,7 @@ inline LaunchConfig get_msm_cooperative_config(int total_buckets, int threads_pe
  * @brief Configuration for MSM bucket reduction (multi-threaded per window)
  * 
  * For large bucket counts, use one block per window with multiple threads.
+ * The optimized kernel uses parallel suffix scan and tree reduction.
  * 
  * @param num_windows Number of windows in the MSM
  * @param num_buckets Number of buckets per window
@@ -670,14 +671,20 @@ inline LaunchConfig get_msm_reduction_config(int num_windows, int num_buckets, i
     int optimal = gpu.get_optimal_threads(KernelType::BUCKET_REDUCE);
     
     if (num_buckets >= GPUConfig::MSM_MULTITHREAD_THRESHOLD) {
-        // Multi-threaded: one block per window
-        // Need: 2 arrays of P elements + 1 array of int counts
+        // Multi-threaded: one block per window with parallel reduction
+        // Shared memory: 2 arrays of P elements + 1 array of int counts
         // shared_mem = 2 * threads * element_size + threads * sizeof(int)
         int max_threads_by_shared = gpu.shared_mem_per_block / (2 * element_size + sizeof(int));
         max_threads_by_shared = (max_threads_by_shared / gpu.warp_size) * gpu.warp_size;  // Round to warp
         
-        int threads = std::min({GPUConfig::DEFAULT_COMPUTE_THREADS, optimal, max_threads_by_shared});
+        // Use more threads for better parallelism in reduction (up to 512)
+        int threads = std::min({512, optimal, max_threads_by_shared});
         threads = std::max(threads, gpu.warp_size);  // At least one warp
+        
+        // Ensure thread count is power of 2 for clean parallel reduction
+        int pow2 = gpu.warp_size;
+        while (pow2 * 2 <= threads) pow2 *= 2;
+        threads = pow2;
         
         size_t shared_mem = 2 * threads * element_size + threads * sizeof(int);
         return LaunchConfig(threads, num_windows, shared_mem);

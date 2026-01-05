@@ -398,19 +398,16 @@ __global__ void parallel_bucket_reduction_kernel(
 }
 
 /**
- * @brief Multi-threaded bucket reduction - one block per window
+ * @brief Multi-threaded bucket reduction with parallel suffix scan
  * 
- * Optimized triangle summation: each thread computes a partial triangle,
- * then thread 0 combines using closed-form adjustment formulas to avoid O(n) loops.
+ * Uses parallel Blelloch-style exclusive scan for suffix sums, avoiding
+ * serial combination bottlenecks.
  * 
- * Triangle sum: Σ_{i=1}^{n} i * bucket[i] = Σ running_sum where running_sum accumulates
- * 
- * For thread t handling buckets [start, end):
- *   local_running = Σ bucket[i] for i in [start, end)
- *   local_window  = Σ_{i=start}^{end-1} (end-i) * bucket[i]  (partial triangle)
- * 
- * To combine: each thread's window sum needs adjustment by the suffix sum
- * (sum of all buckets after this thread's range) multiplied by the count.
+ * Algorithm:
+ * 1. Each thread computes local triangle sum for its bucket range (parallel)
+ * 2. Parallel exclusive suffix scan to compute suffix_sum for each thread
+ * 3. Each thread adjusts its local_window with suffix_sum * count (parallel)
+ * 4. Parallel reduction to sum all adjusted window values
  */
 template<typename P>
 __global__ void parallel_bucket_reduction_multithread_kernel(
@@ -436,8 +433,7 @@ __global__ void parallel_bucket_reduction_multithread_kernel(
     P local_running = P::identity();
     P local_window = P::identity();
     
-    // Compute local triangle sum for this thread's bucket range
-    // We process from high to low: running_sum accumulates, window adds running each step
+    // 1. Compute local triangle sum for this thread's bucket range (parallel)
     for (int i = end_bucket - 1; i >= start_bucket; i--) {
         point_add(local_running, local_running, window_buckets[i]);
         point_add(local_window, local_window, local_running);
@@ -445,53 +441,74 @@ __global__ void parallel_bucket_reduction_multithread_kernel(
     
     extern __shared__ char shared_mem[];
     P* shared_running = reinterpret_cast<P*>(shared_mem);
-    P* shared_window = shared_running + THREADS_PER_WINDOW;
-    int* shared_counts = reinterpret_cast<int*>(shared_window + THREADS_PER_WINDOW);
+    P* shared_suffix = shared_running + THREADS_PER_WINDOW;
+    int* shared_counts = reinterpret_cast<int*>(shared_suffix + THREADS_PER_WINDOW);
     
     shared_running[tid] = local_running;
-    shared_window[tid] = local_window;
     shared_counts[tid] = my_count;
     __syncthreads();
     
-    // Thread 0 combines all partial results
-    // Key insight: thread t's window needs suffix_sum * my_count added
-    // where suffix_sum = Σ shared_running[t+1..end]
-    if (tid == 0) {
-        P total_window = P::identity();
-        P suffix_sum = P::identity();
-        
-        // Process from highest thread to lowest
-        for (int t = THREADS_PER_WINDOW - 1; t >= 0; t--) {
-            int t_count = shared_counts[t];
-            if (t_count <= 0) continue;
-            
-            // Add this thread's partial window
-            point_add(total_window, total_window, shared_window[t]);
-            
-            // Add suffix_sum * t_count using repeated doubling
-            // This converts O(t_count) additions to O(log(t_count)) doubles + additions
-            if (!suffix_sum.is_identity()) {
-                P adjustment = P::identity();
-                P base = suffix_sum;
-                int remaining = t_count;
-                
-                while (remaining > 0) {
-                    if (remaining & 1) {
-                        point_add(adjustment, adjustment, base);
-                    }
-                    remaining >>= 1;
-                    if (remaining > 0) {
-                        point_double(base, base);
-                    }
-                }
-                point_add(total_window, total_window, adjustment);
-            }
-            
-            // Update suffix sum for next (lower) thread
-            point_add(suffix_sum, suffix_sum, shared_running[t]);
+    // 2. Parallel exclusive suffix scan for running sums
+    // suffix_sum[t] = Σ shared_running[t+1..end]
+    // We compute this as a reverse inclusive scan, then shift
+    
+    // First, copy running sums into suffix array (reversed conceptually)
+    shared_suffix[tid] = shared_running[tid];
+    __syncthreads();
+    
+    // Parallel reverse scan: treat index (THREADS_PER_WINDOW - 1 - tid) as the forward index
+    // This computes prefix sums from the right side
+    for (int stride = 1; stride < THREADS_PER_WINDOW; stride *= 2) {
+        P val = P::identity();
+        if (tid + stride < THREADS_PER_WINDOW) {
+            val = shared_suffix[tid + stride];
         }
+        __syncthreads();
+        if (tid + stride < THREADS_PER_WINDOW) {
+            point_add(shared_suffix[tid], shared_suffix[tid], val);
+        }
+        __syncthreads();
+    }
+    
+    // shared_suffix[tid] now contains inclusive suffix sum from tid to end
+    // We need exclusive suffix sum (from tid+1 to end)
+    P suffix_sum = (tid + 1 < THREADS_PER_WINDOW) ? shared_suffix[tid + 1] : P::identity();
+    __syncthreads();
+    
+    // 3. Each thread adjusts its window value (parallel)
+    // adjustment = suffix_sum * my_count (scalar multiplication via double-and-add)
+    P adjusted_window = local_window;
+    if (my_count > 0 && !suffix_sum.is_identity()) {
+        P adjustment = P::identity();
+        P base = suffix_sum;
+        int remaining = my_count;
         
-        window_results[window_idx] = total_window;
+        while (remaining > 0) {
+            if (remaining & 1) {
+                point_add(adjustment, adjustment, base);
+            }
+            remaining >>= 1;
+            if (remaining > 0) {
+                point_double(base, base);
+            }
+        }
+        point_add(adjusted_window, adjusted_window, adjustment);
+    }
+    
+    // 4. Parallel reduction to sum all adjusted windows
+    shared_suffix[tid] = adjusted_window;
+    __syncthreads();
+    
+    // Standard parallel reduction
+    for (int stride = THREADS_PER_WINDOW / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            point_add(shared_suffix[tid], shared_suffix[tid], shared_suffix[tid + stride]);
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        window_results[window_idx] = shared_suffix[0];
     }
 }
 
@@ -500,7 +517,13 @@ __global__ void parallel_bucket_reduction_multithread_kernel(
 // =============================================================================
 
 /**
- * @brief Parallel final accumulation - processes windows in parallel
+ * @brief Parallel final accumulation with tree reduction
+ * 
+ * Processes window doublings in parallel, then uses shared memory tree reduction
+ * to sum all windows efficiently instead of serial thread-0 loop.
+ * 
+ * Each window w contributes: window_results[w] << (w * c)
+ * where << means repeated point doubling.
  */
 template<typename P>
 __global__ void final_accumulation_parallel_kernel(
@@ -509,24 +532,42 @@ __global__ void final_accumulation_parallel_kernel(
     int num_windows,
     int c
 ) {
-    int w = threadIdx.x;
+    extern __shared__ char shared_mem[];
+    P* shared_windows = reinterpret_cast<P*>(shared_mem);
     
-    if (w < num_windows && w > 0) {
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    
+    // 1. Each thread handles its assigned windows (parallel)
+    // Apply the required doublings and store in shared memory
+    for (int w = tid; w < num_windows; w += num_threads) {
         P val = window_results[w];
-        int doublings = w * c;
-        for (int i = 0; i < doublings; i++) {
-            point_double(val, val);
+        if (w > 0) {
+            int doublings = w * c;
+            for (int i = 0; i < doublings; i++) {
+                point_double(val, val);
+            }
         }
-        window_results[w] = val;
+        shared_windows[w] = val;
     }
     __syncthreads();
     
-    if (threadIdx.x == 0) {
-        P acc = window_results[0];
-        for (int i = 1; i < num_windows; i++) {
-            point_add(acc, acc, window_results[i]);
+    // 2. Parallel tree reduction
+    // Round up to next power of 2 for clean reduction
+    int size = 1;
+    while (size < num_windows) size *= 2;
+    
+    for (int stride = size / 2; stride > 0; stride /= 2) {
+        for (int i = tid; i < stride; i += num_threads) {
+            if (i < num_windows && i + stride < num_windows) {
+                point_add(shared_windows[i], shared_windows[i], shared_windows[i + stride]);
+            }
         }
-        *result = acc;
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        *result = shared_windows[0];
     }
 }
 
@@ -799,7 +840,10 @@ cudaError_t msm_cuda(
             while (threads < num_windows) threads *= 2;
             if (threads > 256) threads = 256;
             
-            final_accumulation_parallel_kernel<P><<<1, threads, 0, stream>>>(
+            // Shared memory: one P element per window for tree reduction
+            size_t shared_mem = num_windows * sizeof(P);
+            
+            final_accumulation_parallel_kernel<P><<<1, threads, shared_mem, stream>>>(
                 d_result,
                 d_window_results,
                 num_windows,
