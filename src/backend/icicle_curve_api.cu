@@ -65,6 +65,9 @@
 #include "field.cuh"
 #include "point.cuh"
 
+// Include GPU config for thread/block constants
+#include "gpu_config.cuh"
+
 // Include full MSM template definitions - this file provides the instantiations
 #include "msm.cuh"
 
@@ -74,9 +77,18 @@ using namespace bls12_381;
 // Internal Helper Kernels (Montgomery and Coordinate Conversions)
 // =============================================================================
 
-// NOTE: Scalars are NOT converted to Montgomery form!
-// MSM extracts bits from scalars to determine bucket indices.
-// Converting to Montgomery would change the bit pattern and compute wrong scalar multiplication.
+// Convert scalars from Montgomery form to standard form
+// This is needed when are_scalars_montgomery_form=true, because MSM extracts
+// bits from scalars to determine bucket indices - we need the actual scalar value.
+__global__ void scalars_from_montgomery_kernel(Fr* scalars, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    
+    Fr& s = scalars[idx];
+    Fr s_std;
+    field_from_montgomery(s_std, s);
+    s = s_std;
+}
 
 // Convert G1 affine points from standard form to Montgomery form
 __global__ void points_to_montgomery_kernel(G1Affine* points, int n) {
@@ -224,8 +236,8 @@ __global__ void g2_jacobian_to_standard_projective_kernel(G2Projective* result, 
  * @brief G1 MSM wrapper for ICICLE backend
  * 
  * Handles Montgomery form conversions and coordinate system conversions:
- * - Input: Standard form affine points + scalars
- * - Internal: Montgomery form for field arithmetic
+ * - Input: Affine points + scalars (standard or Montgomery form per config flags)
+ * - Internal: Montgomery form for point field arithmetic, standard form for scalars
  * - Output: Standard form standard projective (x=X/Z, y=Y/Z)
  */
 static icicle::eIcicleError msm_cuda_impl(
@@ -245,8 +257,8 @@ static icicle::eIcicleError msm_cuda_impl(
     cudaStream_t stream = static_cast<cudaStream_t>(config.stream);
     cudaError_t err;
     
-    // We need to convert inputs to Montgomery form and outputs from Montgomery form.
-    // To avoid modifying input data, we allocate temporary buffers.
+    // We need to convert inputs to appropriate form and outputs from Montgomery form.
+    // To avoid modifying input data, we allocate temporary buffers when needed.
     Fr* d_scalars = nullptr;
     G1Affine* d_bases = nullptr;
     G1Projective* d_result = nullptr;
@@ -256,14 +268,32 @@ static icicle::eIcicleError msm_cuda_impl(
     bool allocated_result = false;
     
     // --- Handle scalars ---
-    // IMPORTANT: Do NOT convert scalars to Montgomery form!
     // MSM extracts bits from scalars to determine bucket indices.
-    // Scalars must remain in standard form so bits represent actual scalar value.
+    // Scalars must be in STANDARD form so bits represent actual scalar value.
+    // If are_scalars_montgomery_form=true, we need to convert from Montgomery to standard.
     if (config.are_scalars_on_device) {
-        // Data already on device - use directly (no conversion needed)
-        d_scalars = const_cast<Fr*>(reinterpret_cast<const Fr*>(scalars));
+        if (config.are_scalars_montgomery_form) {
+            // Scalars are on device in Montgomery form - need to convert to standard
+            err = cudaMalloc(&d_scalars, msm_size * sizeof(Fr));
+            if (err != cudaSuccess) goto cleanup;
+            allocated_scalars = true;
+            
+            err = cudaMemcpyAsync(d_scalars, scalars, msm_size * sizeof(Fr),
+                                  cudaMemcpyDeviceToDevice, stream);
+            if (err != cudaSuccess) goto cleanup;
+            
+            // Convert from Montgomery to standard form
+            constexpr int threads = gpu::GPUConfig::DEFAULT_COMPUTE_THREADS;
+            int blocks = (msm_size + threads - 1) / threads;
+            scalars_from_montgomery_kernel<<<blocks, threads, 0, stream>>>(d_scalars, msm_size);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) goto cleanup;
+        } else {
+            // Scalars already in standard form - use directly
+            d_scalars = const_cast<Fr*>(reinterpret_cast<const Fr*>(scalars));
+        }
     } else {
-        // Data on host - copy to device (no Montgomery conversion)
+        // Data on host - copy to device
         err = cudaMalloc(&d_scalars, msm_size * sizeof(Fr));
         if (err != cudaSuccess) goto cleanup;
         allocated_scalars = true;
@@ -271,6 +301,15 @@ static icicle::eIcicleError msm_cuda_impl(
         err = cudaMemcpyAsync(d_scalars, scalars, msm_size * sizeof(Fr),
                               cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess) goto cleanup;
+        
+        if (config.are_scalars_montgomery_form) {
+            // Convert from Montgomery to standard form
+            constexpr int threads_host = gpu::GPUConfig::DEFAULT_COMPUTE_THREADS;
+            int blocks = (msm_size + threads_host - 1) / threads_host;
+            scalars_from_montgomery_kernel<<<blocks, threads_host, 0, stream>>>(d_scalars, msm_size);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) goto cleanup;
+        }
     }
     
     // --- Handle bases (points) ---
@@ -285,7 +324,7 @@ static icicle::eIcicleError msm_cuda_impl(
             if (err != cudaSuccess) goto cleanup;
             
             // Convert to Montgomery form
-            int threads = 256;
+            constexpr int threads = gpu::GPUConfig::DEFAULT_COMPUTE_THREADS;
             int blocks = (msm_size + threads - 1) / threads;
             points_to_montgomery_kernel<<<blocks, threads, 0, stream>>>(d_bases, msm_size);
             err = cudaGetLastError();
@@ -303,7 +342,7 @@ static icicle::eIcicleError msm_cuda_impl(
         if (err != cudaSuccess) goto cleanup;
         
         if (!config.are_points_montgomery_form) {
-            int threads = 256;
+            constexpr int threads = gpu::GPUConfig::DEFAULT_COMPUTE_THREADS;
             int blocks = (msm_size + threads - 1) / threads;
             points_to_montgomery_kernel<<<blocks, threads, 0, stream>>>(d_bases, msm_size);
             err = cudaGetLastError();
@@ -408,8 +447,8 @@ static icicle::eIcicleError msm_precompute_bases_cuda_impl(
  * @brief G2 MSM wrapper for ICICLE backend
  * 
  * Handles Montgomery form conversions and coordinate system conversions:
- * - Input: Standard form G2 affine points (Fq2 coordinates) + scalars
- * - Internal: Montgomery form for field arithmetic
+ * - Input: G2 affine points (Fq2 coordinates) + scalars (standard or Montgomery form per config)
+ * - Internal: Montgomery form for point field arithmetic, standard form for scalars
  * - Output: Standard form standard projective (x=X/Z, y=Y/Z)
  */
 static icicle::eIcicleError msm_g2_cuda_impl(
@@ -429,8 +468,8 @@ static icicle::eIcicleError msm_g2_cuda_impl(
     cudaStream_t stream = static_cast<cudaStream_t>(config.stream);
     cudaError_t err;
     
-    // We need to convert inputs to Montgomery form and outputs from Montgomery form.
-    // To avoid modifying input data, we allocate temporary buffers.
+    // We need to convert inputs to appropriate form and outputs from Montgomery form.
+    // To avoid modifying input data, we allocate temporary buffers when needed.
     Fr* d_scalars = nullptr;
     G2Affine* d_bases = nullptr;
     G2Projective* d_result = nullptr;
@@ -440,14 +479,32 @@ static icicle::eIcicleError msm_g2_cuda_impl(
     bool allocated_result = false;
     
     // --- Handle scalars ---
-    // IMPORTANT: Do NOT convert scalars to Montgomery form!
     // MSM extracts bits from scalars to determine bucket indices.
-    // Scalars must remain in standard form so bits represent actual scalar value.
+    // Scalars must be in STANDARD form so bits represent actual scalar value.
+    // If are_scalars_montgomery_form=true, we need to convert from Montgomery to standard.
     if (config.are_scalars_on_device) {
-        // Data already on device - use directly (no conversion needed)
-        d_scalars = const_cast<Fr*>(reinterpret_cast<const Fr*>(scalars));
+        if (config.are_scalars_montgomery_form) {
+            // Scalars are on device in Montgomery form - need to convert to standard
+            err = cudaMalloc(&d_scalars, msm_size * sizeof(Fr));
+            if (err != cudaSuccess) goto cleanup;
+            allocated_scalars = true;
+            
+            err = cudaMemcpyAsync(d_scalars, scalars, msm_size * sizeof(Fr),
+                                  cudaMemcpyDeviceToDevice, stream);
+            if (err != cudaSuccess) goto cleanup;
+            
+            // Convert from Montgomery to standard form
+            constexpr int threads = gpu::GPUConfig::DEFAULT_COMPUTE_THREADS;
+            int blocks = (msm_size + threads - 1) / threads;
+            scalars_from_montgomery_kernel<<<blocks, threads, 0, stream>>>(d_scalars, msm_size);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) goto cleanup;
+        } else {
+            // Scalars already in standard form - use directly
+            d_scalars = const_cast<Fr*>(reinterpret_cast<const Fr*>(scalars));
+        }
     } else {
-        // Data on host - copy to device (no Montgomery conversion)
+        // Data on host - copy to device
         err = cudaMalloc(&d_scalars, msm_size * sizeof(Fr));
         if (err != cudaSuccess) goto cleanup;
         allocated_scalars = true;
@@ -455,6 +512,15 @@ static icicle::eIcicleError msm_g2_cuda_impl(
         err = cudaMemcpyAsync(d_scalars, scalars, msm_size * sizeof(Fr),
                               cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess) goto cleanup;
+        
+        if (config.are_scalars_montgomery_form) {
+            // Convert from Montgomery to standard form
+            constexpr int threads_host = gpu::GPUConfig::DEFAULT_COMPUTE_THREADS;
+            int blocks = (msm_size + threads_host - 1) / threads_host;
+            scalars_from_montgomery_kernel<<<blocks, threads_host, 0, stream>>>(d_scalars, msm_size);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) goto cleanup;
+        }
     }
     
     // --- Handle bases (points) ---
@@ -469,7 +535,7 @@ static icicle::eIcicleError msm_g2_cuda_impl(
             if (err != cudaSuccess) goto cleanup;
             
             // Convert to Montgomery form
-            int threads = 256;
+            constexpr int threads = gpu::GPUConfig::DEFAULT_COMPUTE_THREADS;
             int blocks = (msm_size + threads - 1) / threads;
             g2_points_to_montgomery_kernel<<<blocks, threads, 0, stream>>>(d_bases, msm_size);
             err = cudaGetLastError();
@@ -487,7 +553,7 @@ static icicle::eIcicleError msm_g2_cuda_impl(
         if (err != cudaSuccess) goto cleanup;
         
         if (!config.are_points_montgomery_form) {
-            int threads = 256;
+            constexpr int threads = gpu::GPUConfig::DEFAULT_COMPUTE_THREADS;
             int blocks = (msm_size + threads - 1) / threads;
             g2_points_to_montgomery_kernel<<<blocks, threads, 0, stream>>>(d_bases, msm_size);
             err = cudaGetLastError();
