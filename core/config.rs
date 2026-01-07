@@ -237,10 +237,17 @@ pub fn should_use_gpu_batch(individual_size: usize, batch_count: usize) -> bool 
     //
     // ICICLE recommendation: Use batch_size parameter with are_points_shared_in_batch=true
     // when all MSMs use the same bases (e.g., SRS commitments)
+    
     let total_work = individual_size.saturating_mul(batch_count);
     
-    // GPU beneficial if individual size meets threshold OR total work is significant
-    should_use_gpu(individual_size) || (batch_count >= 2 && total_work >= min_gpu_size())
+    match device_type() {
+        DeviceType::Gpu => true,  // Force GPU for all batches
+        DeviceType::Cpu => false, // Force BLST for all batches
+        DeviceType::Auto => {
+            // GPU beneficial if individual size meets threshold OR total work is significant
+            should_use_gpu(individual_size) || (batch_count >= 2 && total_work >= min_gpu_size())
+        }
+    }
 }
 
 /// Get the ICICLE backend installation path.
