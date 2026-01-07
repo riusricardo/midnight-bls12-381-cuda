@@ -48,5 +48,10 @@ trace-all = ["trace-msm", "trace-fft"]
 name = "midnight_bls12_381_cuda"
 path = "core/mod.rs"
 
+[[bench]]
+name = "gpu_msm"
+harness = false
+required-features = ["gpu"]
+
 [package.metadata.docs.rs]
 all-features = true

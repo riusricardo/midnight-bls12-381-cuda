@@ -91,7 +91,7 @@ pub use config::{device_type, min_gpu_size, should_use_gpu, should_use_gpu_batch
 
 // GPU-specific exports (only when gpu feature is enabled)
 #[cfg(feature = "gpu")]
-pub use msm::{GpuMsmContext, MsmError, MsmHandle, G2MsmHandle};
+pub use msm::{GpuMsmContext, MsmError, MsmHandle, G2MsmHandle, BatchMsmHandle};
 #[cfg(feature = "gpu")]
 pub use ntt::{GpuNttContext, NttError, NttHandle};
 #[cfg(feature = "gpu")]
