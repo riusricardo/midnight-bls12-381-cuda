@@ -16,9 +16,9 @@ The BLS12-381 CUDA Backend is a purpose-built acceleration layer for zero-knowle
 
 From the ICICLE benchmarks and real-world usage:
 
-- **MSM**: Up to 50x faster than CPU implementations for operations with 2^20 or more points
-- **NTT**: Up to 100x faster for large polynomial operations (2^22 elements)
-- **Vector Operations**: Up to 200x faster for element-wise operations on large arrays
+- **MSM**: Faster than CPU implementations for operations with 2^20 or more points
+- **NTT**: Faster for large polynomial operations (2^22 elements)
+- **Vector Operations**: Faster for element-wise operations on large arrays
 
 The backend uses intelligent hybrid execution, automatically selecting GPU or CPU based on operation size to optimize both throughput and latency.
 
