@@ -1,0 +1,55 @@
+diff --git a/proofs/src/plonk/permutation/prover.rs b/proofs/src/plonk/permutation/prover.rs
+index f0e811e5..dfa972db 100644
+--- a/proofs/src/plonk/permutation/prover.rs
++++ b/proofs/src/plonk/permutation/prover.rs
+@@ -15,6 +15,9 @@ use crate::{
+     utils::arithmetic::{eval_polynomial, parallelize},
+ };
+ 
++#[cfg(feature = "gpu")]
++use crate::poly::batch_commit::batch_commit_refs;
++
+ #[cfg_attr(feature = "bench-internal", derive(Clone))]
+ #[derive(Debug)]
+ pub(crate) struct CommittedSet<F: PrimeField> {
+@@ -71,6 +74,9 @@ impl Argument {
+         let mut last_z = F::ONE;
+ 
+         let mut sets = vec![];
++        
++        // Collect all z polynomials in Lagrange form for batch committing
++        let mut z_polys_lagrange: Vec<Polynomial<F, LagrangeCoeff>> = vec![];
+ 
+         for (columns, permutations) in
+             self.columns.chunks(chunk_len).zip(pkey.permutations.chunks(chunk_len))
+@@ -154,12 +160,25 @@ impl Argument {
+             // Set new last_z
+             last_z = z[domain.n as usize - (blinding_factors + 1)];
+ 
+-            let permutation_product_commitment = CS::commit_lagrange(params, &z);
+-            let permutation_product_poly = domain.lagrange_to_coeff(z);
+-
+-            // Hash the permutation product commitment
+-            transcript.write(&permutation_product_commitment)?;
++            z_polys_lagrange.push(z);
++        }
+ 
++        // Batch commit all permutation product polynomials with GPU pipelining
++        #[cfg(feature = "gpu")]
++        let commitments = {
++            let poly_refs: Vec<_> = z_polys_lagrange.iter().collect();
++            batch_commit_refs::<F, CS>(params, &poly_refs)
++        };
++        
++        #[cfg(not(feature = "gpu"))]
++        let commitments: Vec<_> = z_polys_lagrange.iter()
++            .map(|z| CS::commit_lagrange(params, z))
++            .collect();
++
++        // Write all commitments to transcript and build the sets
++        for (z, commitment) in z_polys_lagrange.into_iter().zip(commitments.into_iter()) {
++            let permutation_product_poly = domain.lagrange_to_coeff(z);
++            transcript.write(&commitment)?;
+             sets.push(CommittedSet {
+                 permutation_product_poly,
+             });

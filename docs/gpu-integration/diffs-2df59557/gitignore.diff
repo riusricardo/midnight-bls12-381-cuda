@@ -1,0 +1,36 @@
+diff --git a/.gitignore b/.gitignore
+index b77d5a92..8d76926b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -15,3 +15,31 @@ Cargo.lock
+ 
+ # macOS metadata
+ .DS_Store
++
++# External repositories (GPU/CUDA dependencies)
++blst_repo/
++icicle_repo/
++circuits/examples/assets
++
++# GPU/CUDA build artifacts
++*.so
++*.a
++*.dylib
++*.dll
++*.nsys-rep
++profile_data/
++
++# CUDA compilation artifacts
++*.cubin
++*.fatbin
++*.ptx
++*.gpu
++*.i
++*.ii
++*.cudafe*
++*.module_id
++*.hash
++
++# Build directories for external CUDA code
++bls12-381-cuda-backend/bls12-381/build/
++bls12-381-cuda-backend/target/

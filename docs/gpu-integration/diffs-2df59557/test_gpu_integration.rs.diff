@@ -1,0 +1,188 @@
+diff --git a/proofs/tests/gpu_integration.rs b/proofs/tests/gpu_integration.rs
+new file mode 100644
+index 00000000..fdeb4295
+--- /dev/null
++++ b/proofs/tests/gpu_integration.rs
+@@ -0,0 +1,182 @@
++//! GPU integration tests
++//!
++//! These tests verify GPU acceleration with ICICLE backend.
++//! Requires GPU feature and ICICLE backend installed.
++
++#![cfg(feature = "gpu")]
++
++use midnight_bls12_381_cuda::GpuMsmContext;
++use midnight_curves::{Fq as Scalar, G1Affine, G1Projective};
++use ff::Field;
++use group::{Group, Curve, prime::PrimeCurveAffine};
++
++#[test]
++fn test_gpu_msm_small() {
++    // Small MSM: 1024 points
++    let size = 1024;
++    test_msm_with_size(size);
++}
++
++#[test]
++fn test_gpu_msm_k14() {
++    // K=14: 16384 points
++    let size = 16384;
++    test_msm_with_size(size);
++}
++
++#[test]
++fn test_gpu_msm_k16() {
++    // K=16: 65536 points
++    let size = 65536;
++    test_msm_with_size(size);
++}
++
++fn test_msm_with_size(size: usize) {
++    let mut rng = rand::thread_rng();
++
++    // Generate random scalars and points
++    let scalars: Vec<Scalar> = (0..size).map(|_| Scalar::random(&mut rng)).collect();
++    let points: Vec<G1Affine> = (0..size)
++        .map(|_| G1Projective::random(&mut rng).to_affine())
++        .collect();
++
++    // Create GPU MSM context
++    let ctx = GpuMsmContext::new().expect("Failed to create MSM context");
++
++    // Execute MSM
++    let result = ctx.msm(&scalars, &points).expect("MSM should succeed");
++
++    // Verify result is not identity (with random inputs, extremely unlikely)
++    assert!(!bool::from(result.is_identity()));
++
++    // Verify against CPU reference
++    let points_proj: Vec<G1Projective> = points.iter().map(|p| G1Projective::from(*p)).collect();
++    let cpu_result = G1Projective::multi_exp(&points_proj, &scalars);
++    assert_eq!(result, cpu_result, "GPU and CPU results should match");
++}
++
++#[test]
++fn test_gpu_context_creation() {
++    let ctx = GpuMsmContext::new();
++    assert!(ctx.is_ok(), "GPU context should initialize successfully");
++}
++
++#[test]
++fn test_gpu_msm_simple_identity() {
++    // Simple test: MSM with scalar=1 and generator should return n * G
++    let generator = G1Affine::generator();
++    let n = 1024;
++    let scalars = vec![Scalar::ONE; n];
++    let points = vec![generator; n];
++
++    let ctx = GpuMsmContext::new().expect("Failed to create MSM context");
++
++    // This computes sum of n generators = n * G
++    let result = ctx.msm(&scalars, &points).expect("MSM should succeed");
++
++    // Expected: n * G
++    let expected = G1Projective::from(generator) * Scalar::from(n as u64);
++    assert_eq!(result, expected, "MSM result should be n * G");
++}
++
++#[test]
++fn test_gpu_msm_empty() {
++    let ctx = GpuMsmContext::new().expect("Failed to create MSM context");
++    let result = ctx.msm(&[], &[]).expect("Empty MSM should succeed");
++    assert!(bool::from(result.is_identity()), "Empty MSM should return identity");
++}
++
++// =============================================================================
++// G2 MSM Tests
++// =============================================================================
++
++use midnight_curves::{G2Affine, G2Projective};
++
++#[test]
++fn test_gpu_g2_msm_small() {
++    // Small G2 MSM: 1024 points
++    let size = 1024;
++    test_g2_msm_with_size(size);
++}
++
++#[test]
++fn test_gpu_g2_msm_k14() {
++    // K=14: 16384 points
++    let size = 16384;
++    test_g2_msm_with_size(size);
++}
++
++#[test]
++fn test_gpu_g2_msm_k16() {
++    // K=16: 65536 points
++    let size = 65536;
++    test_g2_msm_with_size(size);
++}
++
++fn test_g2_msm_with_size(size: usize) {
++    let mut rng = rand::thread_rng();
++
++    // Generate random scalars and G2 points
++    let scalars: Vec<Scalar> = (0..size).map(|_| Scalar::random(&mut rng)).collect();
++    let points: Vec<G2Affine> = (0..size)
++        .map(|_| G2Projective::random(&mut rng).to_affine())
++        .collect();
++
++    // Create GPU MSM context
++    let ctx = GpuMsmContext::new().expect("Failed to create MSM context");
++
++    // Execute G2 MSM
++    let result = ctx.g2_msm(&scalars, &points).expect("G2 MSM should succeed");
++
++    // Verify result is not identity (with random inputs, extremely unlikely)
++    assert!(!bool::from(result.is_identity()), "G2 MSM result should not be identity");
++
++    // Verify against CPU reference
++    let points_proj: Vec<G2Projective> = points.iter().map(|p| G2Projective::from(*p)).collect();
++    let cpu_result = G2Projective::multi_exp(&points_proj, &scalars);
++    assert_eq!(result, cpu_result, "GPU and CPU G2 results should match");
++}
++
++#[test]
++fn test_gpu_g2_msm_simple_identity() {
++    // Simple test: MSM with scalar=1 and generator should return n * G2
++    let generator = G2Affine::generator();
++    let n = 1024;
++    let scalars = vec![Scalar::ONE; n];
++    let points = vec![generator; n];
++
++    let ctx = GpuMsmContext::new().expect("Failed to create MSM context");
++
++    // This computes sum of n G2 generators = n * G2
++    let result = ctx.g2_msm(&scalars, &points).expect("G2 MSM should succeed");
++
++    // Expected: n * G2
++    let expected = G2Projective::from(generator) * Scalar::from(n as u64);
++    assert_eq!(result, expected, "G2 MSM result should be n * G2");
++}
++
++#[test]
++fn test_gpu_g2_msm_zero_scalars() {
++    // Test with all zero scalars - should return identity
++    let size = 1024;
++    let scalars = vec![Scalar::ZERO; size];
++    let points: Vec<G2Affine> = (0..size)
++        .map(|_| G2Projective::random(&mut rand::thread_rng()).to_affine())
++        .collect();
++
++    let ctx = GpuMsmContext::new().expect("Failed to create MSM context");
++    let result = ctx.g2_msm(&scalars, &points).expect("G2 MSM should succeed");
++
++    assert!(
++        bool::from(result.is_identity()),
++        "G2 MSM with zero scalars should be identity"
++    );
++}
++
++#[test]
++fn test_gpu_warmup() {
++    let ctx = GpuMsmContext::new().expect("Failed to create MSM context");
++    let warmup_time = ctx.warmup();
++    assert!(warmup_time.is_ok(), "Warmup should succeed");
++    println!("GPU warmup completed in {:?}", warmup_time.unwrap());
++}

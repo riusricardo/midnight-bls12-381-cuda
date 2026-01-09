@@ -1,0 +1,15 @@
+diff --git a/proofs/src/poly/domain.rs b/proofs/src/poly/domain.rs
+index dccaea8a..cd36c951 100644
+--- a/proofs/src/poly/domain.rs
++++ b/proofs/src/poly/domain.rs
+@@ -5,7 +5,9 @@ use std::marker::PhantomData;
+ 
+ use ff::WithSmallOrderMulGroup;
+ use group::ff::{BatchInvert, Field};
+-use midnight_curves::fft::best_fft;
++
++// Use GPU-aware FFT when available, falls back to CPU automatically
++use crate::utils::fft::best_fft;
+ 
+ use super::{Coeff, ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, Rotation};
+ use crate::utils::{arithmetic::parallelize, rational::Rational};

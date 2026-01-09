@@ -1,0 +1,190 @@
+diff --git a/proofs/src/poly/kzg/mod.rs b/proofs/src/poly/kzg/mod.rs
+index face1689..8892c839 100644
+--- a/proofs/src/poly/kzg/mod.rs
++++ b/proofs/src/poly/kzg/mod.rs
+@@ -75,26 +75,73 @@ where
+         params: &Self::Parameters,
+         polynomial: &Polynomial<E::Fr, Coeff>,
+     ) -> Self::Commitment {
+-        let mut scalars = Vec::<E::Fr>::with_capacity(polynomial.len());
+-        scalars.extend(polynomial.iter());
++        #[cfg(feature = "trace-kzg")]
++        let start = std::time::Instant::now();
++        #[cfg(feature = "trace-kzg")]
++        eprintln!("[KZG::commit] Committing to polynomial of degree {}", polynomial.len());
++        
++        // Use polynomial directly via Deref - no allocation needed
++        let scalars: &[E::Fr] = &**polynomial;
+         let size = scalars.len();
+-
+         assert!(params.g.len() >= size);
+-
+-        msm_specific::<E::G1Affine>(&scalars, &params.g[..size])
++        
++        // Use cached GPU bases when available (following ingonyama-zk pattern)
++        #[cfg(feature = "gpu")]
++        let result = {
++            use crate::gpu_accel::should_use_gpu;
++            
++            if should_use_gpu(size) {
++                use crate::poly::kzg::msm::msm_with_cached_bases;
++                let device_bases = params.get_or_upload_gpu_bases();
++                msm_with_cached_bases::<E::G1Affine>(scalars, device_bases)
++            } else {
++                msm_specific::<E::G1Affine>(scalars, &params.g[..size])
++            }
++        };
++        
++        #[cfg(not(feature = "gpu"))]
++        let result = msm_specific::<E::G1Affine>(scalars, &params.g[..size]);
++        
++        #[cfg(feature = "trace-kzg")]
++        eprintln!("✓  [KZG::commit] Total time: {:?}", start.elapsed());
++        result
+     }
+ 
+     fn commit_lagrange(
+         params: &Self::Parameters,
+         poly: &Polynomial<E::Fr, LagrangeCoeff>,
+     ) -> E::G1 {
+-        let mut scalars = Vec::with_capacity(poly.len());
+-        scalars.extend(poly.iter());
++        #[cfg(feature = "trace-kzg")]
++        let start = std::time::Instant::now();
++        #[cfg(feature = "trace-kzg")]
++        eprintln!("[KZG::commit_lagrange] Committing to Lagrange polynomial of size {}", poly.len());
++        
++        // Use polynomial directly via Deref - no allocation needed
++        let scalars: &[E::Fr] = &**poly;
+         let size = scalars.len();
+ 
+         assert!(params.g_lagrange.len() >= size);
+ 
+-        msm_specific::<E::G1Affine>(&scalars, &params.g_lagrange[0..size])
++        // Use cached GPU Lagrange bases when available
++        #[cfg(feature = "gpu")]
++        let result = {
++            use crate::gpu_accel::should_use_gpu;
++            
++            if should_use_gpu(size) {
++                use crate::poly::kzg::msm::msm_with_cached_bases;
++                let device_bases = params.get_or_upload_gpu_lagrange_bases();
++                msm_with_cached_bases::<E::G1Affine>(scalars, device_bases)
++            } else {
++                msm_specific::<E::G1Affine>(scalars, &params.g_lagrange[0..size])
++            }
++        };
++        
++        #[cfg(not(feature = "gpu"))]
++        let result = msm_specific::<E::G1Affine>(scalars, &params.g_lagrange[0..size]);
++        
++        #[cfg(feature = "trace-kzg")]
++        eprintln!("✓  [KZG::commit_lagrange] Total time: {:?}", start.elapsed());
++        result
+     }
+ 
+     fn multi_open<T: Transcript>(
+@@ -325,6 +372,103 @@ where
+     }
+ }
+ 
++// =============================================================================
++// Async Commitment Helpers (GPU Feature Only)
++// =============================================================================
++
++#[cfg(feature = "gpu")]
++/// Asynchronously commit to a Lagrange polynomial using GPU
++/// 
++/// Launches MSM without waiting, enabling CPU/GPU overlap and pipelining.
++/// Returns a handle that completes to the commitment when waited.
++/// 
++/// # Example
++/// ```rust,ignore
++/// // Launch multiple commits
++/// let handles: Vec<_> = polynomials.iter()
++///     .map(|p| commit_lagrange_async::<Bls12>(params, p))
++///     .collect::<Result<_, _>>()?;
++/// 
++/// // Do CPU work while GPU computes
++/// let metadata = prepare_metadata();
++/// 
++/// // Wait for commitments
++/// let commits: Vec<_> = handles.into_iter()
++///     .map(|h| h.wait())
++///     .collect::<Result<_, _>>()?;
++/// ```
++pub fn commit_lagrange_async<E: MultiMillerLoop>(
++    params: &ParamsKZG<E>,
++    poly: &Polynomial<E::Fr, LagrangeCoeff>,
++) -> Result<crate::gpu_accel::MsmHandle, Error>
++where
++    E::G1: Default + CurveExt<ScalarExt = E::Fr> + ProcessedSerdeObject,
++    E::G1Affine: Default + CurveAffine<ScalarExt = E::Fr, CurveExt = E::G1>,
++{
++    use crate::gpu_accel::should_use_gpu;
++    use crate::poly::kzg::msm::msm_with_cached_bases_async;
++    
++    #[cfg(feature = "trace-kzg")]
++    eprintln!("[KZG::async] Launching async commit for {} coefficients", poly.len());
++    
++    let mut scalars = Vec::with_capacity(poly.len());
++    scalars.extend(poly.iter());
++    let size = scalars.len();
++    
++    assert!(params.g_lagrange.len() >= size);
++    
++    if should_use_gpu(size) {
++        let device_bases = params.get_or_upload_gpu_lagrange_bases();
++        msm_with_cached_bases_async::<E::G1Affine>(&scalars, device_bases)
++    } else {
++        Err(Error::OpeningError)
++    }
++}
++
++#[cfg(feature = "gpu")]
++/// Batch commit multiple Lagrange polynomials asynchronously
++/// 
++/// More efficient than calling commit_lagrange_async() in a loop.
++/// Launches all MSMs together for optimal GPU pipelining.
++pub fn commit_lagrange_batch_async<E: MultiMillerLoop>(
++    params: &ParamsKZG<E>,
++    polys: &[&Polynomial<E::Fr, LagrangeCoeff>],
++) -> Result<Vec<crate::gpu_accel::MsmHandle>, Error>
++where
++    E::G1: Default + CurveExt<ScalarExt = E::Fr> + ProcessedSerdeObject,
++    E::G1Affine: Default + CurveAffine<ScalarExt = E::Fr, CurveExt = E::G1>,
++{
++    use crate::gpu_accel::should_use_gpu;
++    use crate::poly::kzg::msm::msm_batch_async;
++    
++    #[cfg(feature = "trace-kzg")]
++    eprintln!("[KZG::async] Launching {} async commits", polys.len());
++    
++    if polys.is_empty() {
++        return Ok(vec![]);
++    }
++    
++    // Convert all polynomials to scalar vectors
++    let scalars: Vec<Vec<E::Fr>> = polys.iter()
++        .map(|poly| {
++            let mut s = Vec::with_capacity(poly.len());
++            s.extend(poly.iter());
++            s
++        })
++        .collect();
++    
++    let size = scalars[0].len();
++    assert!(params.g_lagrange.len() >= size);
++    
++    if should_use_gpu(size) {
++        let device_bases = params.get_or_upload_gpu_lagrange_bases();
++        let scalar_refs: Vec<&[E::Fr]> = scalars.iter().map(|s| s.as_slice()).collect();
++        msm_batch_async::<E::G1Affine>(&scalar_refs, device_bases)
++    } else {
++        Err(Error::OpeningError)
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use std::hash::Hash;

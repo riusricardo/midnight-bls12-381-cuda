@@ -1,0 +1,263 @@
+diff --git a/proofs/tests/e2e_proof_benchmark.rs b/proofs/tests/e2e_proof_benchmark.rs
+new file mode 100644
+index 00000000..a64006ed
+--- /dev/null
++++ b/proofs/tests/e2e_proof_benchmark.rs
+@@ -0,0 +1,262 @@
++//! End-to-End Proof Generation Benchmark with GPU
++//!
++//! Tests domain-filling circuits to properly stress GPU MSM operations.
++//! The circuit fills most of the domain to ensure polynomial sizes match the domain size.
++//!
++//! Key insight: GPU acceleration requires polynomial sizes >= 32,768 (K≥15).
++//! This means the circuit must actually USE enough rows to fill the domain.
++
++use midnight_curves::{Bls12, Fq};
++use midnight_proofs::{
++    circuit::{Layouter, SimpleFloorPlanner, Value},
++    plonk::{
++        create_proof as create_plonk_proof, keygen_pk, keygen_vk,
++        Advice, Circuit, Column, Constraints, ConstraintSystem, Error, Selector,
++    },
++    poly::{
++        kzg::{params::ParamsKZG, KZGCommitmentScheme},
++    },
++    transcript::{CircuitTranscript, Transcript},
++};
++use blake2b_simd::State as Blake2bState;
++use rand::SeedableRng;
++use rand_chacha::ChaCha8Rng;
++use std::time::Instant;
++
++/// Domain-filling benchmark circuit.
++///
++/// This circuit fills most of the domain with actual assignments,
++/// ensuring polynomial sizes match the domain size (2^K).
++/// This is critical for testing GPU acceleration since MSM size = polynomial size.
++#[derive(Clone)]
++struct DomainFillingCircuit {
++    /// log2 of domain size
++    k: u32,
++    /// Number of advice columns (more columns = more MSM operations)
++    num_advice_cols: usize,
++    /// Fraction of domain to fill (0.0-1.0)
++    fill_ratio: f64,
++}
++
++impl Default for DomainFillingCircuit {
++    fn default() -> Self {
++        Self {
++            k: 15,
++            num_advice_cols: 8,
++            fill_ratio: 0.5, // Fill half the domain
++        }
++    }
++}
++
++#[derive(Clone, Debug)]
++struct DomainFillingConfig {
++    advice_cols: Vec<Column<Advice>>,
++    selector: Selector,
++}
++
++impl Circuit<Fq> for DomainFillingCircuit {
++    type Config = DomainFillingConfig;
++    type FloorPlanner = SimpleFloorPlanner;
++    #[cfg(feature = "circuit-params")]
++    type Params = ();
++
++    fn without_witnesses(&self) -> Self {
++        self.clone()
++    }
++
++    fn configure(meta: &mut ConstraintSystem<Fq>) -> Self::Config {
++        // Create multiple advice columns to generate multiple MSM operations
++        let advice_cols: Vec<_> = (0..8).map(|_| meta.advice_column()).collect();
++        let selector = meta.selector();
++        
++        // Create a gate that involves the advice columns
++        // Gate: selector * (a0 - a0) = 0 (trivially satisfied)
++        meta.create_gate("domain_fill", |vc| {
++            let a0 = vc.query_advice(advice_cols[0], midnight_proofs::poly::Rotation::cur());
++            Constraints::with_selector(selector, vec![a0.clone() - a0])
++        });
++        
++        DomainFillingConfig { advice_cols, selector }
++    }
++
++    fn synthesize(
++        &self,
++        config: Self::Config,
++        mut layouter: impl Layouter<Fq>,
++    ) -> Result<(), Error> {
++        layouter.assign_region(
++            || "domain_fill_region",
++            |mut region| {
++                // Calculate how many rows to fill
++                let domain_size = 1usize << self.k;
++                let rows_to_fill = ((domain_size as f64) * self.fill_ratio) as usize;
++                
++                // Use only the columns we want (but config always has 8)
++                let cols_to_use = self.num_advice_cols.min(config.advice_cols.len());
++                
++                // Fill the region with assignments
++                for row in 0..rows_to_fill {
++                    config.selector.enable(&mut region, row)?;
++                    for (col_idx, col) in config.advice_cols.iter().take(cols_to_use).enumerate() {
++                        region.assign_advice(
++                            || format!("a[{}][{}]", col_idx, row),
++                            *col,
++                            row,
++                            || Value::known(Fq::from((row + col_idx + 1) as u64)),
++                        )?;
++                    }
++                }
++                Ok(())
++            },
++        )
++    }
++}
++
++fn benchmark_domain_filling(k: u32, num_cols: usize, fill_ratio: f64) -> Result<(), Box<dyn std::error::Error>> {
++    let rows = (1usize << k) as f64 * fill_ratio;
++    let poly_size = 1usize << k;
++    println!("\n=== K={} | {} cols | {:.0} rows filled | poly_size={} ===",
++             k, num_cols, rows, poly_size);
++    
++    let mut rng = ChaCha8Rng::seed_from_u64(42);
++    
++    // Step 1: Setup parameters
++    print!("  [1/5] Setup params... ");
++    let start = Instant::now();
++    let params = ParamsKZG::<Bls12>::unsafe_setup(k, &mut rng);
++    let elapsed = start.elapsed();
++    println!("{:>8.2}ms", elapsed.as_secs_f64() * 1000.0);
++    
++    let circuit = DomainFillingCircuit { k, num_advice_cols: num_cols, fill_ratio };
++    
++    // Step 2: Generate VK
++    print!("  [2/5] Generate VK... ");
++    let start = Instant::now();
++    let vk = keygen_vk::<_, KZGCommitmentScheme<Bls12>, _>(&params, &circuit)?;
++    let elapsed = start.elapsed();
++    println!("{:>8.2}ms", elapsed.as_secs_f64() * 1000.0);
++    
++    // Step 3: Generate PK
++    print!("  [3/5] Generate PK... ");
++    let start = Instant::now();
++    let pk = keygen_pk(vk, &circuit)?;
++    let elapsed = start.elapsed();
++    println!("{:>8.2}ms", elapsed.as_secs_f64() * 1000.0);
++    
++    // Step 4: Create proof (this is where GPU MSM operations happen)
++    print!("  [4/5] Proving... ");
++    let start = Instant::now();
++    let mut transcript = CircuitTranscript::<Blake2bState>::init();
++    create_plonk_proof::<_, KZGCommitmentScheme<Bls12>, _, _>(
++        &params,
++        &pk,
++        &[circuit],
++        #[cfg(feature = "committed-instances")]
++        0,
++        &[&[]], // No instance columns
++        &mut rng,
++        &mut transcript,
++    )?;
++    let prove_time = start.elapsed().as_secs_f64() * 1000.0;
++    println!("{:>8.2}ms", prove_time);
++    
++    // Step 5: Finalize
++    print!("  [5/5] Finalize... ");
++    let start = Instant::now();
++    let _proof = transcript.finalize();
++    let elapsed = start.elapsed();
++    println!("{:>8.2}ms", elapsed.as_secs_f64() * 1000.0);
++    
++    println!("  ✓ Proof generated successfully");
++    println!("  Proving time: {:.2}ms (polynomial size: {})", prove_time, poly_size);
++    
++    Ok(())
++}
++
++#[test]
++#[ignore] // Run with: cargo test --test e2e_proof_benchmark --features gpu --release -- --ignored --nocapture
++fn e2e_proof_benchmark() {
++    println!("╔════════════════════════════════════════════════════════════════╗");
++    println!("║  Domain-Filling Proof Generation Benchmark                     ║");
++    println!("║  GPU-Accelerated PLONK Proving (ICICLE)                        ║");
++    println!("╚════════════════════════════════════════════════════════════════╝");
++    
++    #[cfg(feature = "gpu")]
++    {
++        use midnight_bls12_381_cuda::is_gpu_available;
++        println!();
++        if is_gpu_available() {
++            println!("✓ GPU Backend: AVAILABLE (ICICLE CUDA)");
++            println!("  • Threshold: K≥15 (polynomial size ≥ 32,768)");
++            println!("  • All MSM operations with size ≥ 32K will use GPU");
++        } else {
++            println!("⚠ GPU Backend: NOT AVAILABLE");
++            println!("  Will use CPU fallback (BLST)");
++        }
++    }
++    
++    #[cfg(not(feature = "gpu"))]
++    {
++        println!();
++        println!("• GPU Feature: DISABLED");
++        println!("  Using CPU-only (BLST) for all operations");
++    }
++    
++    println!();
++    println!("This benchmark creates domain-filling circuits where:");
++    println!("  • Polynomial size = domain size = 2^K");
++    println!("  • MSM operations process full-size polynomials");
++    println!("  • GPU should be utilized for K≥15");
++    println!();
++    println!("═══════════════════════════════════════════════════════════════");
++    
++    // Test cases: (K, num_advice_cols, fill_ratio, description)
++    let test_cases = vec![
++        // Below GPU threshold - CPU baseline
++        (14, 8, 0.5, "K=14: Below GPU threshold (poly_size=16K) - CPU baseline"),
++        
++        // At and above GPU threshold - GPU should kick in
++        (15, 8, 0.5, "K=15: GPU threshold (poly_size=32K) - GPU should activate"),
++        (16, 8, 0.5, "K=16: GPU sweet spot (poly_size=64K)"),
++        (17, 4, 0.5, "K=17: Large circuit (poly_size=128K) - 4 cols"),
++    ];
++    
++    for (k, num_cols, fill_ratio, description) in test_cases {
++        println!("\n{}", description);
++        match benchmark_domain_filling(k, num_cols, fill_ratio) {
++            Ok(_) => {},
++            Err(e) => {
++                eprintln!("  ✗ Error: {}", e);
++                return;
++            }
++        }
++    }
++    
++    println!();
++    println!("╔════════════════════════════════════════════════════════════════╗");
++    println!("║  Benchmark Complete!                                           ║");
++    println!("╚════════════════════════════════════════════════════════════════╝");
++    
++    println!();
++    println!("Performance Analysis:");
++    println!("  • K=14: CPU-only baseline (~16K point MSMs)");
++    println!("  • K=15: GPU threshold reached (~32K point MSMs)");
++    println!("  • K=16: GPU acceleration visible (~64K point MSMs)");
++    println!("  • K=17: GPU essential (~128K point MSMs)");
++    println!();
++    
++    #[cfg(feature = "gpu")]
++    println!("To compare with CPU-only:");
++    #[cfg(feature = "gpu")]
++    println!("   MIDNIGHT_DEVICE=cpu cargo test --test e2e_proof_benchmark --features gpu --release -- --ignored --nocapture");
++    
++    #[cfg(not(feature = "gpu"))]
++    println!("To enable GPU acceleration:");
++    #[cfg(not(feature = "gpu"))]
++    println!("   cargo test --test e2e_proof_benchmark --features gpu --release -- --ignored --nocapture");
++}

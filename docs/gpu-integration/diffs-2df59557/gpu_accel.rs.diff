@@ -1,0 +1,378 @@
+diff --git a/proofs/src/gpu_accel.rs b/proofs/src/gpu_accel.rs
+new file mode 100644
+index 00000000..d620806b
+--- /dev/null
++++ b/proofs/src/gpu_accel.rs
+@@ -0,0 +1,372 @@
++/*
++ * Copyright (C) 2026 Midnight Contributors
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++//! GPU Acceleration Bridge
++//!
++//! This module provides a thin integration layer between midnight-proofs and
++//! the GPU acceleration backend. It re-exports everything GPU-related so that
++//! the rest of midnight-proofs only needs to import from this module.
++//!
++//! # Design Goals
++//!
++//! 1. **Single Import Point**: All GPU functionality flows through `gpu_accel`
++//! 2. **No Direct Backend Imports**: Other modules should NOT import from
++//!    `midnight_bls12_381_cuda` or `icicle_*` directly
++//! 3. **Minimal Coupling**: Makes it easy to swap backends in the future
++//!
++//! # Usage
++//!
++//! ```rust,ignore
++//! use crate::gpu_accel::{should_use_gpu, PrecomputedBases, GpuMsmContext};
++//!
++//! if should_use_gpu(size) {
++//!     let ctx = get_msm_context();
++//!     let result = ctx.msm(scalars, bases)?;
++//! }
++//! ```
++//!
++//! # Type-Safe Dispatch
++//!
++//! For generic code that needs to dispatch to GPU based on type:
++//!
++//! ```rust,ignore
++//! use crate::gpu_accel::{dispatch_msm, with_fq_slice, is_g1_affine};
++//!
++//! // Option 1: High-level dispatch (handles everything)
++//! let result = dispatch_msm::<C, _, _>(
++//!     coeffs,
++//!     |fq_coeffs| gpu_msm(fq_coeffs, &bases),
++//!     || cpu_msm(coeffs, bases),
++//! );
++//!
++//! // Option 2: Manual type check with callback
++//! if is_g1_affine::<C>() {
++//!     with_fq_slice(coeffs, |fq| do_gpu_stuff(fq));
++//! }
++//! ```
++
++// =============================================================================
++// Re-exports from midnight-bls12-381-cuda
++// =============================================================================
++
++#[cfg(feature = "gpu")]
++pub use midnight_bls12_381_cuda::{
++    // Core types
++    GpuMsmContext,
++    PrecomputedBases,
++    TypeConverter,
++    
++    // MSM handles
++    msm::MsmHandle,
++    BatchMsmHandle,
++    
++    // Backend initialization
++    ensure_backend_loaded,
++    
++    // Threshold functions (re-exported as-is for GPU code paths)
++    should_use_gpu as backend_should_use_gpu,
++    should_use_gpu_batch,
++    
++    // Trait-based API
++    global_accelerator,
++    GpuAccelerator, 
++    GpuCachedBases,
++    MsmBackend,
++    NttBackend,
++    
++    // Type-safe dispatch helpers (the key abstraction)
++    is_fq, is_g1_affine, is_g1_projective,
++    should_dispatch_to_gpu_field, should_dispatch_to_gpu_curve, should_dispatch_to_gpu_ntt,
++    try_as_fq_slice, try_as_fq_slice_mut, try_as_g1_affine_slice, try_as_g1_projective_slice,
++    projective_to_curve,
++    dispatch_msm, dispatch_ntt_inplace, dispatch_batch_msm, DispatchResult,
++    with_fq_slice, with_fq_slice_mut, with_g1_affine_slice,
++};
++
++// Re-export ICICLE runtime types needed by params.rs
++#[cfg(feature = "gpu")]
++pub use icicle_runtime::{
++    memory::{DeviceVec, HostSlice},
++    stream::IcicleStream,
++    Device as IcicleDevice,
++    set_device as icicle_set_device,
++};
++
++#[cfg(feature = "gpu")]
++use midnight_curves::{Fq, G1Affine, G1Projective};
++
++#[cfg(feature = "gpu")]
++use ff::Field;
++
++// =============================================================================
++// Public API (thin wrappers with alternate names to avoid collision)
++// =============================================================================
++
++/// Initialize GPU backend eagerly.
++///
++/// Call this at application startup to avoid first-request latency.
++/// Returns the warmup duration if GPU is available.
++#[cfg(feature = "gpu")]
++pub fn init_gpu_backend() -> Option<std::time::Duration> {
++    use tracing::info;
++    
++    let accel = global_accelerator();
++    
++    if let Err(e) = accel.initialize() {
++        tracing::warn!("Failed to initialize GPU backend: {}", e);
++        return None;
++    }
++    
++    match accel.warmup() {
++        Ok(duration) => {
++            info!("GPU backend warmed up in {:?}", duration);
++            Some(duration)
++        }
++        Err(e) => {
++            tracing::warn!("GPU warmup failed: {}", e);
++            None
++        }
++    }
++}
++
++#[cfg(not(feature = "gpu"))]
++pub fn init_gpu_backend() -> Option<std::time::Duration> {
++    None
++}
++
++/// Check if GPU acceleration is available.
++#[cfg(feature = "gpu")]
++pub fn is_gpu_available() -> bool {
++    MsmBackend::is_gpu_available(global_accelerator())
++}
++
++#[cfg(not(feature = "gpu"))]
++pub fn is_gpu_available() -> bool {
++    false
++}
++
++/// Check if GPU should be used for the given size.
++/// 
++/// This is a wrapper that provides a non-GPU fallback and checks
++/// both GPU availability and the size threshold.
++#[cfg(feature = "gpu")]
++pub fn should_use_gpu(size: usize) -> bool {
++    backend_should_use_gpu(size)
++}
++
++#[cfg(not(feature = "gpu"))]
++pub fn should_use_gpu(_size: usize) -> bool {
++    false
++}
++
++/// Check if GPU should be used for NTT of the given size.
++#[cfg(feature = "gpu")]
++pub fn should_use_gpu_ntt(size: usize) -> bool {
++    NttBackend::should_use_gpu(global_accelerator(), size)
++}
++
++#[cfg(not(feature = "gpu"))]
++pub fn should_use_gpu_ntt(_size: usize) -> bool {
++    false
++}
++
++// =============================================================================
++// GPU Bases Handle (for SRS caching)
++// =============================================================================
++
++/// Handle to GPU-cached bases.
++///
++/// This type wraps the backend's cached bases and can be stored in
++/// proof parameters for efficient MSM operations.
++#[cfg(feature = "gpu")]
++pub struct GpuBasesHandle {
++    inner: Box<dyn GpuCachedBases>,
++}
++
++#[cfg(feature = "gpu")]
++impl GpuBasesHandle {
++    /// Create from backend's cached bases.
++    pub fn new<T: GpuCachedBases + 'static>(bases: T) -> Self {
++        Self {
++            inner: Box::new(bases),
++        }
++    }
++    
++    /// Get the number of bases.
++    pub fn len(&self) -> usize {
++        self.inner.len()
++    }
++    
++    /// Check if empty.
++    pub fn is_empty(&self) -> bool {
++        self.inner.is_empty()
++    }
++}
++
++#[cfg(feature = "gpu")]
++impl std::fmt::Debug for GpuBasesHandle {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("GpuBasesHandle")
++            .field("len", &self.inner.len())
++            .field("precompute_factor", &self.inner.precompute_factor())
++            .finish()
++    }
++}
++
++// =============================================================================
++// MSM Operations
++// =============================================================================
++
++/// Compute MSM with GPU acceleration (if available and beneficial).
++///
++/// This function automatically chooses between GPU and CPU based on size
++/// and availability.
++#[cfg(feature = "gpu")]
++pub fn msm_auto(scalars: &[Fq], bases: &[G1Affine]) -> G1Projective {
++    let accel = global_accelerator();
++    
++    if MsmBackend::should_use_gpu(accel, scalars.len()) {
++        match accel.msm(scalars, bases) {
++            Ok(result) => return result,
++            Err(e) => {
++                tracing::warn!("GPU MSM failed, falling back to CPU: {}", e);
++            }
++        }
++    }
++    
++    // CPU fallback via BLST
++    msm_blst(scalars, bases)
++}
++
++/// Compute MSM with BLST (CPU).
++#[cfg(feature = "gpu")]
++fn msm_blst(scalars: &[Fq], bases: &[G1Affine]) -> G1Projective {
++    let proj_bases: Vec<G1Projective> = bases.iter().map(|a| (*a).into()).collect();
++    G1Projective::multi_exp(&proj_bases, scalars)
++}
++
++// =============================================================================
++// SRS Base Caching
++// =============================================================================
++
++/// Upload SRS bases to GPU memory for efficient MSM.
++///
++/// Returns a handle that can be stored in proof parameters.
++#[cfg(feature = "gpu")]
++pub fn upload_bases(bases: &[G1Affine]) -> Result<GpuBasesHandle, String> {
++    let accel = global_accelerator();
++    
++    accel
++        .upload_bases(bases)
++        .map(|cached| GpuBasesHandle::new(cached))
++        .map_err(|e| e.to_string())
++}
++
++// =============================================================================
++// NTT Operations
++// =============================================================================
++
++/// Perform forward NTT with GPU acceleration (if available and beneficial).
++#[cfg(feature = "gpu")]
++pub fn forward_ntt_auto(data: &mut [Fq]) -> Result<(), String> {
++    let accel = global_accelerator();
++    
++    if NttBackend::should_use_gpu(accel, data.len()) {
++        match accel.forward_ntt_inplace(data) {
++            Ok(()) => return Ok(()),
++            Err(e) => {
++                tracing::warn!("GPU NTT failed, falling back to CPU: {}", e);
++            }
++        }
++    }
++    
++    // CPU fallback
++    forward_ntt_cpu(data)
++}
++
++/// Perform inverse NTT with GPU acceleration (if available and beneficial).
++#[cfg(feature = "gpu")]
++pub fn inverse_ntt_auto(data: &mut [Fq]) -> Result<(), String> {
++    let accel = global_accelerator();
++    
++    if NttBackend::should_use_gpu(accel, data.len()) {
++        match accel.inverse_ntt_inplace(data) {
++            Ok(()) => return Ok(()),
++            Err(e) => {
++                tracing::warn!("GPU INTT failed, falling back to CPU: {}", e);
++            }
++        }
++    }
++    
++    // CPU fallback
++    inverse_ntt_cpu(data)
++}
++
++#[cfg(feature = "gpu")]
++fn forward_ntt_cpu(data: &mut [Fq]) -> Result<(), String> {
++    use ff::PrimeField;
++    
++    let n = data.len();
++    if !n.is_power_of_two() {
++        return Err("NTT size must be power of two".to_string());
++    }
++    
++    let k = n.ilog2();
++    let mut omega = Fq::ROOT_OF_UNITY;
++    for _ in k..Fq::S {
++        omega = omega.square();
++    }
++    
++    midnight_curves::fft::best_fft(data, omega, k);
++    Ok(())
++}
++
++#[cfg(feature = "gpu")]
++fn inverse_ntt_cpu(data: &mut [Fq]) -> Result<(), String> {
++    use ff::{Field, PrimeField};
++    
++    let n = data.len();
++    if !n.is_power_of_two() {
++        return Err("NTT size must be power of two".to_string());
++    }
++    
++    let k = n.ilog2();
++    let mut omega = Fq::ROOT_OF_UNITY;
++    for _ in k..Fq::S {
++        omega = omega.square();
++    }
++    let omega_inv = omega.invert().unwrap();
++    let n_inv = Fq::from(n as u64).invert().unwrap();
++    
++    midnight_curves::fft::best_fft(data, omega_inv, k);
++    
++    for val in data.iter_mut() {
++        *val *= n_inv;
++    }
++    
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    
++    #[test]
++    fn test_gpu_availability() {
++        // This should work regardless of GPU availability
++        let available = is_gpu_available();
++        println!("GPU available: {}", available);
++    }
++    
++    #[test]
++    fn test_should_use_gpu_thresholds() {
++        // Small sizes should not use GPU
++        assert!(!should_use_gpu(100));
++        
++        // Check NTT threshold
++        assert!(!should_use_gpu_ntt(100));
++    }
++}

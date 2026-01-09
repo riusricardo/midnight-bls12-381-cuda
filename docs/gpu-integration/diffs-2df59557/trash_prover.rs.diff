@@ -1,0 +1,80 @@
+diff --git a/proofs/src/plonk/trash/prover.rs b/proofs/src/plonk/trash/prover.rs
+index 998a29b3..2118cde7 100644
+--- a/proofs/src/plonk/trash/prover.rs
++++ b/proofs/src/plonk/trash/prover.rs
+@@ -17,26 +17,35 @@ pub(crate) struct Committed<F: PrimeField> {
+     pub(crate) trash_poly: Polynomial<F, Coeff>,
+ }
+ 
++/// Intermediate state after computing the trash polynomial but before commitment.
++/// This enables batch committing multiple trash arguments together.
++#[cfg_attr(feature = "bench-internal", derive(Clone))]
++#[derive(Debug)]
++pub(crate) struct TrashComputed<F: PrimeField> {
++    /// Trash polynomial in Lagrange form (ready for commitment)
++    pub(crate) trash_poly_lagrange: Polynomial<F, LagrangeCoeff>,
++}
++
+ pub(crate) struct Evaluated<F: PrimeField>(Committed<F>);
+ 
+ impl<F: WithSmallOrderMulGroup<3> + Ord> Argument<F> {
++    /// Compute the trash polynomial without committing.
++    /// This enables batch committing multiple trash arguments together.
++    /// 
++    /// Returns `TrashComputed` which contains the trash polynomial in Lagrange form.
++    /// Call `TrashComputed::finalize` with a commitment to complete the process.
+     #[allow(clippy::too_many_arguments)]
+-    pub(crate) fn commit<'a, 'params: 'a, CS, T>(
++    pub(crate) fn compute<'a>(
+         &self,
+-        params: &'params CS::Parameters,
+         domain: &EvaluationDomain<F>,
+         trash_challenge: F,
+         advice_values: &'a [Polynomial<F, LagrangeCoeff>],
+         fixed_values: &'a [Polynomial<F, LagrangeCoeff>],
+         instance_values: &'a [Polynomial<F, LagrangeCoeff>],
+         challenges: &'a [F],
+-        transcript: &mut T,
+-    ) -> Result<Committed<F>, Error>
++    ) -> TrashComputed<F>
+     where
+         F: FromUniformBytes<64>,
+-        CS: PolynomialCommitmentScheme<F>,
+-        CS::Commitment: Hashable<T::Hash>,
+-        T: Transcript,
+     {
+         let compressed_expression = self
+             .constraint_expressions
+@@ -56,12 +65,27 @@ impl<F: WithSmallOrderMulGroup<3> + Ord> Argument<F> {
+                 acc * trash_challenge + &expression
+             });
+ 
+-        let trash_commitment = CS::commit_lagrange(params, &compressed_expression);
+-        let trash_poly = domain.lagrange_to_coeff(compressed_expression);
+-
+-        // Hash permuted input commitment
+-        transcript.write(&trash_commitment)?;
++        TrashComputed {
++            trash_poly_lagrange: compressed_expression,
++        }
++    }
++}
+ 
++impl<F: PrimeField> TrashComputed<F> {
++    /// Finalize the trash argument with a pre-computed commitment.
++    /// This is used when batch committing multiple trash arguments.
++    pub(crate) fn finalize<CS: PolynomialCommitmentScheme<F>, T: Transcript>(
++        self,
++        domain: &EvaluationDomain<F>,
++        commitment: CS::Commitment,
++        transcript: &mut T,
++    ) -> Result<Committed<F>, Error>
++    where
++        F: WithSmallOrderMulGroup<3>,
++        CS::Commitment: Hashable<T::Hash>,
++    {
++        let trash_poly = domain.lagrange_to_coeff(self.trash_poly_lagrange);
++        transcript.write(&commitment)?;
+         Ok(Committed { trash_poly })
+     }
+ }

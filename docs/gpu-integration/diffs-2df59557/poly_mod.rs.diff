@@ -1,0 +1,14 @@
+diff --git a/proofs/src/poly/mod.rs b/proofs/src/poly/mod.rs
+index b52202d3..ae221e82 100644
+--- a/proofs/src/poly/mod.rs
++++ b/proofs/src/poly/mod.rs
+@@ -25,6 +25,9 @@ pub mod kzg;
+ 
+ pub mod commitment;
+ 
++/// Batch commitment operations with GPU pipelining support
++pub mod batch_commit;
++
+ pub use domain::*;
+ pub use query::{ProverQuery, VerifierQuery};
+ 

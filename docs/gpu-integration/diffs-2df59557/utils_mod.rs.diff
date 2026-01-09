@@ -1,0 +1,12 @@
+diff --git a/proofs/src/utils/mod.rs b/proofs/src/utils/mod.rs
+index a600627c..82435799 100644
+--- a/proofs/src/utils/mod.rs
++++ b/proofs/src/utils/mod.rs
+@@ -4,4 +4,7 @@ pub mod arithmetic;
+ pub mod helpers;
+ pub mod rational;
+ 
++/// GPU-aware FFT operations
++pub mod fft;
++
+ pub use helpers::SerdeFormat;

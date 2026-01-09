@@ -1,0 +1,56 @@
+diff --git a/proofs/Cargo.toml b/proofs/Cargo.toml
+index a4fd3bf6..50fc7e74 100644
+--- a/proofs/Cargo.toml
++++ b/proofs/Cargo.toml
+@@ -49,6 +49,18 @@ criterion = { version = "0.7", optional = true }
+ tabbycat = { version = "0.1", features = ["attributes"], optional = true }
+ num-bigint = { workspace = true }
+ 
++# GPU acceleration via external crate (all GPU code flows through this)
++# ICICLE dependencies come transitively through midnight-bls12-381-cuda
++midnight-bls12-381-cuda = { path = "../bls12-381-cuda-backend", optional = true }
++
++# Direct ICICLE dependencies for params.rs base uploads
++# These are needed because we re-export ICICLE types through gpu_bridge
++icicle-runtime = { git = "https://github.com/ingonyama-zk/icicle.git", tag = "v4.0.0", optional = true }
++once_cell = { version = "1.20", optional = true }
++
++# Compile-time assertions for memory layout verification
++static_assertions = "1.1"
++
+ [dev-dependencies]
+ assert_matches = "1.5"
+ proptest = "1"
+@@ -88,5 +100,32 @@ committed-instances = []
+ # Feature to expose internal prover types and benchmarking utilities.
+ bench-internal = ["criterion"]
+ 
++# Instrumentation features for performance analysis
++# These add detailed tracing to measure operation timing and throughput
++# Note: These should NOT be enabled in production builds due to performance overhead
++trace-msm = []        # Trace multi-scalar multiplication operations
++trace-fft = []        # Trace FFT/IFFT operations
++trace-phases = []     # Trace high-level prover phases
++trace-kzg = []        # Trace KZG commitment operations
++trace-all = ["trace-msm", "trace-fft", "trace-phases", "trace-kzg"]
++
++# GPU acceleration features
++# All GPU code flows through gpu_bridge module and midnight-bls12-381-cuda crate
++gpu = ["midnight-bls12-381-cuda/gpu", "icicle-runtime", "once_cell"]
++gpu-cuda = ["gpu"]    # Future: separate CUDA backend
++
+ [lib]
+ bench = false
++
++# Temporarily commented out - examples removed
++# [[example]]
++# name = "gpu_benchmark"
++# required-features = ["gpu"]
++
++# [[example]]
++# name = "gpu_init"
++# required-features = ["gpu"]
++
++# [[example]]
++# name = "plonk_msm_benchmark"
++# required-features = ["gpu"]

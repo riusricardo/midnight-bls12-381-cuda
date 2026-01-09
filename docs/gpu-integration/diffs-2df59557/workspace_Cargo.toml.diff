@@ -1,0 +1,13 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index bcaa0681..2abce817 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,7 +1,7 @@
+ [workspace]
+ resolver = "2"
+ 
+-members = ["proofs", "curves", "circuits", "aggregator", "zkir", "zk_stdlib"]
++members = ["proofs", "curves", "circuits", "aggregator", "zkir", "zk_stdlib", "bls12-381-cuda-backend"]
+ 
+ package = { license-file = "LICENSE" }
+ 

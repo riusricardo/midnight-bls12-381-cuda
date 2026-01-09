@@ -1,0 +1,215 @@
+diff --git a/proofs/src/plonk/lookup/prover.rs b/proofs/src/plonk/lookup/prover.rs
+index a78fcc7e..d16e38b2 100644
+--- a/proofs/src/plonk/lookup/prover.rs
++++ b/proofs/src/plonk/lookup/prover.rs
+@@ -37,6 +37,17 @@ pub(crate) struct Committed<F: PrimeField> {
+     pub(crate) product_poly: Polynomial<F, Coeff>,
+ }
+ 
++/// Intermediate state after computing the product polynomial but before commitment.
++/// This enables batch committing multiple lookup products together.
++#[cfg_attr(feature = "bench-internal", derive(Clone))]
++#[derive(Debug)]
++pub(crate) struct ProductComputed<F: PrimeField> {
++    pub(crate) permuted_input_poly: Polynomial<F, Coeff>,
++    pub(crate) permuted_table_poly: Polynomial<F, Coeff>,
++    /// Product polynomial in Lagrange form (ready for commitment)
++    pub(crate) product_poly_lagrange: Polynomial<F, LagrangeCoeff>,
++}
++
+ pub(crate) struct Evaluated<F: PrimeField> {
+     constructed: Committed<F>,
+ }
+@@ -147,41 +158,25 @@ impl<F: WithSmallOrderMulGroup<3> + Ord + Hash> Argument<F> {
+ }
+ 
+ impl<F: WithSmallOrderMulGroup<3>> Permuted<F> {
+-    /// Given a Lookup with input expressions, table expressions, and the
+-    /// permuted input expression and permuted table expression, this method
+-    /// constructs the grand product polynomial over the lookup. The grand
+-    /// product polynomial is used to populate the `Product<C>` struct. The
+-    /// `Product<C>` struct is added to the Lookup and finally returned by the
+-    /// method.
+-    pub(crate) fn commit_product<CS: PolynomialCommitmentScheme<F>, T: Transcript>(
++    /// Compute the product polynomial without committing.
++    /// This enables batch committing multiple lookup products together.
++    /// 
++    /// Returns `ProductComputed` which contains the product polynomial in Lagrange form.
++    /// Call `ProductComputed::finalize` with a commitment to complete the process.
++    pub(crate) fn compute_product<CS: PolynomialCommitmentScheme<F>>(
+         self,
+         pk: &ProvingKey<F, CS>,
+-        params: &CS::Parameters,
+         beta: F,
+         gamma: F,
+         mut rng: impl RngCore + CryptoRng,
+-        transcript: &mut T,
+-    ) -> Result<Committed<F>, Error>
++    ) -> ProductComputed<F>
+     where
+         F: WithSmallOrderMulGroup<3> + FromUniformBytes<64>,
+-        CS::Commitment: Hashable<T::Hash>,
+     {
+         let blinding_factors = pk.vk.cs.blinding_factors();
+-        // Goal is to compute the products of fractions
+-        //
+-        // Numerator: (\theta^{m-1} a_0(\omega^i) + \theta^{m-2} a_1(\omega^i) + ... +
+-        // \theta a_{m-2}(\omega^i) + a_{m-1}(\omega^i) + \beta)
+-        //            * (\theta^{m-1} s_0(\omega^i) + \theta^{m-2} s_1(\omega^i) + ... +
+-        //              \theta s_{m-2}(\omega^i) + s_{m-1}(\omega^i) + \gamma)
+-        // Denominator: (a'(\omega^i) + \beta) (s'(\omega^i) + \gamma)
+-        //
+-        // where a_j(X) is the jth input expression in this lookup,
+-        // where a'(X) is the compression of the permuted input expressions,
+-        // s_j(X) is the jth table expression in this lookup,
+-        // s'(X) is the compression of the permuted table expressions,
+-        // and i is the ith row of the expression.
++        
++        // Compute lookup product denominator
+         let mut lookup_product = vec![F::ZERO; pk.vk.n() as usize];
+-        // Denominator uses the permuted input expression and permuted table expression
+         parallelize(&mut lookup_product, |lookup_product, start| {
+             for ((lookup_product, permuted_input_value), permuted_table_value) in lookup_product
+                 .iter_mut()
+@@ -192,105 +187,80 @@ impl<F: WithSmallOrderMulGroup<3>> Permuted<F> {
+             }
+         });
+ 
+-        // Batch invert to obtain the denominators for the lookup product
+-        // polynomials
++        // Batch invert denominators
+         lookup_product.iter_mut().batch_invert();
+ 
+-        // Finish the computation of the entire fraction by computing the numerators
+-        // (\theta^{m-1} a_0(\omega^i) + \theta^{m-2} a_1(\omega^i) + ... + \theta
+-        // a_{m-2}(\omega^i) + a_{m-1}(\omega^i) + \beta)
+-        // * (\theta^{m-1} s_0(\omega^i) + \theta^{m-2} s_1(\omega^i) + ... + \theta
+-        //   s_{m-2}(\omega^i) + s_{m-1}(\omega^i) + \gamma)
++        // Compute numerators
+         parallelize(&mut lookup_product, |product, start| {
+             for (i, product) in product.iter_mut().enumerate() {
+                 let i = i + start;
+-
+                 *product *= &(self.compressed_input_expression[i] + &beta);
+                 *product *= &(self.compressed_table_expression[i] + &gamma);
+             }
+         });
+ 
+-        // The product vector is a vector of products of fractions of the form
+-        //
+-        // Numerator: (\theta^{m-1} a_0(\omega^i) + \theta^{m-2} a_1(\omega^i) + ... +
+-        // \theta a_{m-2}(\omega^i) + a_{m-1}(\omega^i) + \beta)
+-        //            * (\theta^{m-1} s_0(\omega^i) + \theta^{m-2} s_1(\omega^i) + ... +
+-        //              \theta s_{m-2}(\omega^i) + s_{m-1}(\omega^i) + \gamma)
+-        // Denominator: (a'(\omega^i) + \beta) (s'(\omega^i) + \gamma)
+-        //
+-        // where there are m input expressions and m table expressions,
+-        // a_j(\omega^i) is the jth input expression in this lookup,
+-        // a'j(\omega^i) is the permuted input expression,
+-        // s_j(\omega^i) is the jth table expression in this lookup,
+-        // s'(\omega^i) is the permuted table expression,
+-        // and i is the ith row of the expression.
+-
+-        // Compute the evaluations of the lookup product polynomial
+-        // over our domain, starting with z[0] = 1
++        // Compute the product polynomial evaluations
+         let z = iter::once(F::ONE)
+             .chain(lookup_product)
+             .scan(F::ONE, |state, cur| {
+                 *state *= &cur;
+                 Some(*state)
+             })
+-            // Take all rows including the "last" row which should
+-            // be a boolean (and ideally 1, else soundness is broken)
+             .take(pk.vk.n() as usize - blinding_factors)
+-            // Chain random blinding factors.
+             .chain((0..blinding_factors).map(|_| F::random(&mut rng)))
+             .collect::<Vec<_>>();
+         assert_eq!(z.len(), pk.vk.n() as usize);
+         let z = pk.vk.domain.lagrange_from_vec(z);
+ 
+-        #[cfg(debug_assertions)]
+-        // This test works only with intermediate representations in this method.
+-        // It can be used for debugging purposes.
++        #[cfg(feature = "sanity-checks")]
+         {
+-            // While in Lagrange representation, check that product is correctly constructed
+             let u = (pk.vk.n() as usize) - (blinding_factors + 1);
+-
+-            // l_0(X) * (1 - z(X)) = 0
+             assert_eq!(z[0], F::ONE);
+-
+-            // z(\omega X) (a'(X) + \beta) (s'(X) + \gamma)
+-            // - z(X) (\theta^{m-1} a_0(X) + ... + a_{m-1}(X) + \beta) (\theta^{m-1} s_0(X)
+-            //   + ... + s_{m-1}(X) + \gamma)
+             for i in 0..u {
+                 let mut left = z[i + 1];
+-                let permuted_input_value = &self.permuted_input_expression[i];
+-
+-                let permuted_table_value = &self.permuted_table_expression[i];
+-
+-                left *= &(beta + permuted_input_value);
+-                left *= &(gamma + permuted_table_value);
++                left *= &(beta + &self.permuted_input_expression[i]);
++                left *= &(gamma + &self.permuted_table_expression[i]);
+ 
+                 let mut right = z[i];
+-                let mut input_term = self.compressed_input_expression[i];
+-                let mut table_term = self.compressed_table_expression[i];
+-
+-                input_term += &(beta);
+-                table_term += &(gamma);
+-                right *= &(input_term * &table_term);
++                right *= &(self.compressed_input_expression[i] + &beta);
++                right *= &(self.compressed_table_expression[i] + &gamma);
+ 
+                 assert_eq!(left, right);
+             }
+-
+-            // l_last(X) * (z(X)^2 - z(X)) = 0
+-            // Assertion will fail only when soundness is broken, in which
+-            // case this z[u] value will be zero. (bad!)
+             assert_eq!(z[u], F::ONE);
+         }
+ 
+-        let product_commitment = CS::commit_lagrange(params, &z);
+-        let z = pk.vk.domain.lagrange_to_coeff(z);
+-
+-        // Hash product commitment
+-        transcript.write(&product_commitment)?;
++        ProductComputed {
++            permuted_input_poly: self.permuted_input_poly,
++            permuted_table_poly: self.permuted_table_poly,
++            product_poly_lagrange: z,
++        }
++    }
++}
+ 
+-        Ok(Committed::<F> {
++impl<F: PrimeField> ProductComputed<F> {
++    /// Finalize the lookup product with a pre-computed commitment.
++    /// This is used when batch committing multiple lookups.
++    pub(crate) fn finalize<CS: PolynomialCommitmentScheme<F>, T: Transcript>(
++        self,
++        pk: &ProvingKey<F, CS>,
++        commitment: CS::Commitment,
++        transcript: &mut T,
++    ) -> Result<Committed<F>, Error>
++    where
++        F: WithSmallOrderMulGroup<3>,
++        CS::Commitment: Hashable<T::Hash>,
++    {
++        // Convert to coefficient form
++        let product_poly = pk.vk.domain.lagrange_to_coeff(self.product_poly_lagrange);
++        
++        // Write commitment to transcript
++        transcript.write(&commitment)?;
++        
++        Ok(Committed {
+             permuted_input_poly: self.permuted_input_poly,
+             permuted_table_poly: self.permuted_table_poly,
+-            product_poly: z,
++            product_poly,
+         })
+     }
+ }
