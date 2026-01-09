@@ -170,6 +170,7 @@ unsafe impl Sync for GpuMsmContext {}
 /// - MSM receives the full precomputed buffer (not sliced)
 /// - Correct `precompute_factor` is set in MSMConfig
 /// - Metadata travels with the buffer
+#[cfg(feature = "gpu")]
 pub struct PrecomputedBases {
     /// Device buffer containing bases (original or precomputed)
     buffer: DeviceVec<IcicleG1Affine>,
@@ -179,6 +180,7 @@ pub struct PrecomputedBases {
     precompute_factor: i32,
 }
 
+#[cfg(feature = "gpu")]
 impl PrecomputedBases {
     /// Create from non-precomputed bases
     pub fn new(buffer: DeviceVec<IcicleG1Affine>, size: usize) -> Self {
@@ -1628,6 +1630,7 @@ impl BatchMsmHandle {
     }
 }
 
+#[cfg(feature = "gpu")]
 impl fmt::Debug for BatchMsmHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BatchMsmHandle")

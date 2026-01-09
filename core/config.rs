@@ -148,7 +148,273 @@ pub fn msm_window_size() -> i32 {
     })
 }
 
+// ============================================================================
+// NTT Performance Tuning
+// ============================================================================
+
+/// NTT algorithm selection.
+///
+/// ICICLE provides two NTT algorithms:
+/// - `Auto` (0): Heuristic selection based on size and batch
+/// - `Radix2` (1): Better for small NTTs (log_n ≤ 16, batch_size = 1)
+/// - `MixedRadix` (2): Better for large NTTs and batch operations
+///
+/// From ICICLE docs:
+/// > "Radix 2 is faster for small NTTs (around logN = 16 and batch size 1).
+/// > Mixed radix works better for larger NTTs with larger input sizes."
+///
+/// Parsed from `MIDNIGHT_NTT_ALGORITHM` environment variable.
+/// Default: 0 (Auto - let ICICLE choose)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum NttAlgorithm {
+    Auto = 0,
+    Radix2 = 1,
+    MixedRadix = 2,
+}
+
+impl NttAlgorithm {
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            1 => NttAlgorithm::Radix2,
+            2 => NttAlgorithm::MixedRadix,
+            _ => NttAlgorithm::Auto,
+        }
+    }
+}
+
+/// Get the configured NTT algorithm.
+///
+/// Reads from `MIDNIGHT_NTT_ALGORITHM` environment variable.
+/// Values: "auto" (default), "radix2", "mixed" or "mixedradix"
+pub fn ntt_algorithm() -> NttAlgorithm {
+    static ALGORITHM: OnceLock<NttAlgorithm> = OnceLock::new();
+    *ALGORITHM.get_or_init(|| {
+        std::env::var("MIDNIGHT_NTT_ALGORITHM")
+            .ok()
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "radix2" | "radix-2" | "1" => Some(NttAlgorithm::Radix2),
+                "mixed" | "mixedradix" | "mixed-radix" | "2" => Some(NttAlgorithm::MixedRadix),
+                "auto" | "0" => Some(NttAlgorithm::Auto),
+                other => {
+                    warn!("Unknown MIDNIGHT_NTT_ALGORITHM value '{}', using Auto", other);
+                    None
+                }
+            })
+            .map(|alg| {
+                if alg != NttAlgorithm::Auto {
+                    info!("NTT algorithm from MIDNIGHT_NTT_ALGORITHM: {:?}", alg);
+                }
+                alg
+            })
+            .unwrap_or(NttAlgorithm::Auto)
+    })
+}
+
+/// Enable fast twiddles mode for NTT domain initialization.
+///
+/// From ICICLE docs:
+/// > "When using the Mixed-radix algorithm, it is recommended to initialize 
+/// > the domain in 'fast-twiddles' mode. This is essentially allocating the 
+/// > domain using extra memory but enables faster NTT."
+///
+/// This trades GPU memory for ~10-20% faster NTT operations.
+///
+/// Parsed from `MIDNIGHT_NTT_FAST_TWIDDLES` environment variable.
+/// Default: true (enabled, recommended for Mixed-Radix)
+pub fn ntt_fast_twiddles() -> bool {
+    static FAST_TWIDDLES: OnceLock<bool> = OnceLock::new();
+    *FAST_TWIDDLES.get_or_init(|| {
+        std::env::var("MIDNIGHT_NTT_FAST_TWIDDLES")
+            .ok()
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => Some(true),
+                "false" | "0" | "no" | "off" => Some(false),
+                other => {
+                    warn!("Unknown MIDNIGHT_NTT_FAST_TWIDDLES value '{}', using default", other);
+                    None
+                }
+            })
+            .map(|enabled| {
+                info!("NTT fast twiddles mode: {}", if enabled { "ENABLED" } else { "DISABLED" });
+                enabled
+            })
+            .unwrap_or(true) // Default: enabled for performance
+    })
+}
+
+// =========================================================================
+// NTT Ordering Configuration
+// =========================================================================
+//
+// ICICLE supports multiple orderings for NTT inputs/outputs:
+// - kNN: Natural-Natural (standard, both in natural order)
+// - kNR/kRN: Bit-reversed orderings (radix-2 specific)
+// - kNM/kMN: Mixed-digit orderings (most efficient for mixed-radix)
+//
+// For the common workflow "(1) NTT, (2) elementwise ops, (3) INTT":
+// Using kNM for forward NTT and kMN for inverse avoids reordering overhead.
+
+/// NTT ordering options (matches ICICLE's Ordering enum)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub enum NttOrdering {
+    /// Natural-Natural: Inputs and outputs in natural order (default)
+    #[default]
+    NN,
+    /// Natural-Reversed: Inputs natural, outputs bit-reversed
+    NR,
+    /// Reversed-Natural: Inputs bit-reversed, outputs natural
+    RN,
+    /// Reversed-Reversed: Both bit-reversed
+    RR,
+    /// Natural-Mixed: Inputs natural, outputs mixed-digit-reversed (efficient for mixed-radix)
+    NM,
+    /// Mixed-Natural: Inputs mixed-digit-reversed, outputs natural (efficient for mixed-radix)
+    MN,
+}
+
+impl NttOrdering {
+    /// Convert from i32 representation
+    pub fn from_i32(val: i32) -> Self {
+        match val {
+            0 => NttOrdering::NN,
+            1 => NttOrdering::NR,
+            2 => NttOrdering::RN,
+            3 => NttOrdering::RR,
+            4 => NttOrdering::NM,
+            5 => NttOrdering::MN,
+            _ => NttOrdering::NN,
+        }
+    }
+}
+
+/// Get the configured NTT ordering mode.
+///
+/// Reads from `MIDNIGHT_NTT_ORDERING` environment variable.
+/// Values:
+/// - "nn" (default): Natural-Natural
+/// - "nr": Natural-Reversed  
+/// - "rn": Reversed-Natural
+/// - "rr": Reversed-Reversed
+/// - "nm": Natural-Mixed (recommended for forward NTT with mixed-radix)
+/// - "mn": Mixed-Natural (recommended for inverse NTT with mixed-radix)
+/// - "mixed": Enable mixed ordering mode (uses kNM for forward, kMN for inverse)
+///
+/// Note: "mixed" mode requires using the ordering-aware NTT APIs
+pub fn ntt_ordering() -> NttOrdering {
+    static ORDERING: OnceLock<NttOrdering> = OnceLock::new();
+    *ORDERING.get_or_init(|| {
+        std::env::var("MIDNIGHT_NTT_ORDERING")
+            .ok()
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "nn" | "natural" | "0" => Some(NttOrdering::NN),
+                "nr" | "1" => Some(NttOrdering::NR),
+                "rn" | "2" => Some(NttOrdering::RN),
+                "rr" | "3" => Some(NttOrdering::RR),
+                "nm" | "4" => Some(NttOrdering::NM),
+                "mn" | "5" => Some(NttOrdering::MN),
+                other => {
+                    warn!("Unknown MIDNIGHT_NTT_ORDERING value '{}', using NN", other);
+                    None
+                }
+            })
+            .map(|ord| {
+                if ord != NttOrdering::NN {
+                    info!("NTT ordering from MIDNIGHT_NTT_ORDERING: {:?}", ord);
+                }
+                ord
+            })
+            .unwrap_or(NttOrdering::NN)
+    })
+}
+
+/// Check if mixed ordering mode should be used.
+///
+/// When enabled, forward NTT uses kNM ordering and inverse NTT uses kMN ordering.
+/// This is the most efficient mode for the pattern:
+/// 1. Forward NTT (kNM)
+/// 2. Element-wise operations in frequency domain
+/// 3. Inverse NTT (kMN)
+///
+/// Parsed from `MIDNIGHT_NTT_MIXED_ORDERING` environment variable.
+/// Default: false (use kNN for compatibility)
+pub fn ntt_use_mixed_ordering() -> bool {
+    static USE_MIXED: OnceLock<bool> = OnceLock::new();
+    *USE_MIXED.get_or_init(|| {
+        std::env::var("MIDNIGHT_NTT_MIXED_ORDERING")
+            .ok()
+            .and_then(|s| match s.to_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => Some(true),
+                "false" | "0" | "no" | "off" => Some(false),
+                other => {
+                    warn!("Unknown MIDNIGHT_NTT_MIXED_ORDERING value '{}', using default", other);
+                    None
+                }
+            })
+            .map(|enabled| {
+                if enabled {
+                    info!("NTT mixed ordering mode ENABLED (kNM forward, kMN inverse)");
+                }
+                enabled
+            })
+            .unwrap_or(false) // Default: disabled for compatibility
+    })
+}
+
+// =========================================================================
+// NTT GPU/CPU Decision
+// =========================================================================
+//
+// NTT has different transfer characteristics than MSM:
+// - Only transfers scalars (32 bytes each), no points
+// - O(n log n) computation scales better on GPU
+// - GPU NTT benefits significantly from batching
+//
+// The crossover point is typically lower than MSM.
+
+/// Minimum NTT size threshold for GPU usage.
+///
+/// NTTs smaller than this will use CPU (halo2curves FFT) due to GPU transfer overhead.
+/// Parsed from `MIDNIGHT_NTT_MIN_K` environment variable (as log2 value).
+/// Default: 2^12 = 4096 elements (more aggressive than MSM since less transfer overhead)
+pub fn min_ntt_gpu_size() -> usize {
+    static MIN_SIZE: OnceLock<usize> = OnceLock::new();
+
+    *MIN_SIZE.get_or_init(|| {
+        std::env::var("MIDNIGHT_NTT_MIN_K")
+            .ok()
+            .and_then(|s| s.parse::<u8>().ok())
+            .map(|k| {
+                let size = 1usize << k;
+                info!("MIDNIGHT_NTT_MIN_K={} -> min_ntt_gpu_size={}", k, size);
+                size
+            })
+            .unwrap_or(4096) // Default: K >= 12
+    })
+}
+
+/// Check if NTT should use GPU for a given size.
+///
+/// Returns true if GPU should be used, false means use CPU FFT (halo2curves).
+///
+/// - `DeviceType::Auto`: Use GPU if size >= NTT threshold
+/// - `DeviceType::Gpu`: Always use GPU
+/// - `DeviceType::Cpu`: Always use CPU FFT (never GPU)
+///
+/// # Arguments
+/// * `size` - Number of elements in the NTT
+#[inline]
+pub fn should_use_gpu_ntt(size: usize) -> bool {
+    match device_type() {
+        DeviceType::Gpu => true,  // Force GPU regardless of size
+        DeviceType::Cpu => false, // Force CPU FFT (disable GPU)
+        DeviceType::Auto => size >= min_ntt_gpu_size(),
+    }
+}
+
 /// Minimum problem size threshold for GPU usage.
+
 ///
 /// Problems smaller than this will use BLST due to GPU transfer overhead.
 /// Parsed from `MIDNIGHT_GPU_MIN_K` environment variable (as log2 value).

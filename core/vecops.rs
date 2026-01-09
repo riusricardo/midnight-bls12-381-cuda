@@ -50,6 +50,7 @@
 //! - Zero-copy type conversion via transmute (Montgomery form preserved)
 //! - Async operations available for pipelining
 
+use ff::Field;
 use midnight_curves::Fq;
 #[cfg(not(feature = "gpu"))]
 use crate::GpuError;
@@ -363,6 +364,212 @@ pub fn scalar_mul(scalar: Fq, a: &[Fq]) -> Result<Vec<Fq>, VecOpsError> {
     Ok(TypeConverter::icicle_slice_as_scalar(&host_result).to_vec())
 }
 
+// =========================================================================
+// Bit-Reverse Operations
+// =========================================================================
+//
+// Bit-reversal is used in NTT/FFT algorithms to reorder data between
+// different ordering conventions. ICICLE's bit_reverse is optimized for GPU.
+//
+// Use cases:
+// - Converting between natural (kNN) and bit-reversed (kRN/kNR) orderings
+// - Explicit reordering when using mixed orderings in NTT pipelines
+
+/// GPU-accelerated bit-reverse permutation.
+///
+/// Reorders the input vector according to bit-reversed indices.
+/// For a vector of size N = 2^k, element at index i is moved to index bit_reverse(i).
+///
+/// # Example
+/// For N=8: [a0, a1, a2, a3, a4, a5, a6, a7] → [a0, a4, a2, a6, a1, a5, a3, a7]
+///
+/// # Arguments
+/// * `input` - Input vector (must be power of 2 length)
+///
+/// # Returns
+/// New vector with bit-reversed ordering
+#[cfg(feature = "gpu")]
+pub fn bit_reverse(input: &[Fq]) -> Result<Vec<Fq>, VecOpsError> {
+    use icicle_core::vec_ops::bit_reverse as icicle_bit_reverse;
+
+    if input.is_empty() {
+        return Ok(vec![]);
+    }
+
+    if !input.len().is_power_of_two() {
+        return Err(VecOpsError::ExecutionFailed(format!(
+            "bit_reverse requires power of 2 length, got {}", input.len()
+        )));
+    }
+
+    // Fall back to CPU for small vectors
+    if !should_use_gpu_vecops(input.len()) {
+        return bit_reverse_cpu(input);
+    }
+
+    use crate::backend::ensure_backend_loaded;
+    use icicle_runtime::{Device, set_device};
+
+    ensure_backend_loaded()?;
+    
+    let device = Device::new("CUDA", 0);
+    set_device(&device)
+        .map_err(|e| VecOpsError::ExecutionFailed(format!("Failed to set device: {:?}", e)))?;
+
+    // Zero-copy conversion to ICICLE types
+    let icicle_input = TypeConverter::scalar_slice_as_icicle(input);
+
+    // Allocate result on device
+    let mut device_result = DeviceVec::<IcicleScalar>::device_malloc(input.len())
+        .map_err(|e| VecOpsError::ExecutionFailed(format!("Device malloc failed: {:?}", e)))?;
+
+    // Configure VecOps
+    let cfg = VecOpsConfig::default();
+
+    // Execute GPU bit-reverse
+    icicle_bit_reverse(
+        HostSlice::from_slice(icicle_input),
+        &cfg,
+        &mut device_result[..],
+    )
+    .map_err(|e| VecOpsError::ExecutionFailed(format!("bit_reverse failed: {:?}", e)))?;
+
+    // Copy result back to host
+    let mut host_result = vec![<IcicleScalar as BigNum>::zero(); input.len()];
+    device_result
+        .copy_to_host(HostSlice::from_mut_slice(&mut host_result))
+        .map_err(|e| VecOpsError::ExecutionFailed(format!("Copy to host failed: {:?}", e)))?;
+
+    Ok(TypeConverter::icicle_slice_as_scalar(&host_result).to_vec())
+}
+
+/// GPU-accelerated in-place bit-reverse permutation.
+///
+/// Reorders the input vector in-place according to bit-reversed indices.
+/// More memory-efficient than `bit_reverse` as it doesn't allocate a new vector.
+///
+/// # Arguments
+/// * `input` - Input/output vector (must be power of 2 length)
+#[cfg(feature = "gpu")]
+pub fn bit_reverse_inplace(input: &mut [Fq]) -> Result<(), VecOpsError> {
+    use icicle_core::vec_ops::bit_reverse_inplace as icicle_bit_reverse_inplace;
+
+    if input.is_empty() {
+        return Ok(());
+    }
+
+    if !input.len().is_power_of_two() {
+        return Err(VecOpsError::ExecutionFailed(format!(
+            "bit_reverse_inplace requires power of 2 length, got {}", input.len()
+        )));
+    }
+
+    // Fall back to CPU for small vectors
+    if !should_use_gpu_vecops(input.len()) {
+        bit_reverse_inplace_cpu(input);
+        return Ok(());
+    }
+
+    use crate::backend::ensure_backend_loaded;
+    use icicle_runtime::{Device, set_device};
+
+    ensure_backend_loaded()?;
+    
+    let device = Device::new("CUDA", 0);
+    set_device(&device)
+        .map_err(|e| VecOpsError::ExecutionFailed(format!("Failed to set device: {:?}", e)))?;
+
+    // Zero-copy conversion (for GPU we need device memory)
+    let icicle_input = TypeConverter::scalar_slice_as_icicle(input);
+
+    // Allocate device buffer and copy input
+    let mut device_data = DeviceVec::<IcicleScalar>::device_malloc(input.len())
+        .map_err(|e| VecOpsError::ExecutionFailed(format!("Device malloc failed: {:?}", e)))?;
+    
+    device_data
+        .copy_from_host(HostSlice::from_slice(icicle_input))
+        .map_err(|e| VecOpsError::ExecutionFailed(format!("Copy to device failed: {:?}", e)))?;
+
+    // Configure VecOps
+    let mut cfg = VecOpsConfig::default();
+    cfg.is_a_on_device = true;
+    cfg.is_result_on_device = true;
+
+    // Execute GPU bit-reverse in-place
+    icicle_bit_reverse_inplace(
+        &mut device_data[..],
+        &cfg,
+    )
+    .map_err(|e| VecOpsError::ExecutionFailed(format!("bit_reverse_inplace failed: {:?}", e)))?;
+
+    // Copy result back to host
+    let icicle_output = TypeConverter::scalar_slice_as_icicle_mut(input);
+    device_data
+        .copy_to_host(HostSlice::from_mut_slice(icicle_output))
+        .map_err(|e| VecOpsError::ExecutionFailed(format!("Copy to host failed: {:?}", e)))?;
+
+    Ok(())
+}
+
+/// CPU fallback for bit-reverse (used for small vectors or non-GPU builds)
+fn bit_reverse_cpu(input: &[Fq]) -> Result<Vec<Fq>, VecOpsError> {
+    let n = input.len();
+    let log_n = n.trailing_zeros() as usize;
+    
+    let mut result = vec![Fq::ZERO; n];
+    for i in 0..n {
+        let rev_i = bit_reverse_index(i, log_n);
+        result[rev_i] = input[i];
+    }
+    Ok(result)
+}
+
+/// CPU fallback for in-place bit-reverse
+fn bit_reverse_inplace_cpu(input: &mut [Fq]) {
+    let n = input.len();
+    let log_n = n.trailing_zeros() as usize;
+    
+    for i in 0..n {
+        let rev_i = bit_reverse_index(i, log_n);
+        if i < rev_i {
+            input.swap(i, rev_i);
+        }
+    }
+}
+
+/// Compute bit-reversed index for a given bit width
+#[inline]
+fn bit_reverse_index(mut i: usize, log_n: usize) -> usize {
+    let mut rev = 0;
+    for _ in 0..log_n {
+        rev = (rev << 1) | (i & 1);
+        i >>= 1;
+    }
+    rev
+}
+
+// CPU fallback implementations for non-GPU builds
+#[cfg(not(feature = "gpu"))]
+pub fn bit_reverse(input: &[Fq]) -> Result<Vec<Fq>, VecOpsError> {
+    if !input.len().is_power_of_two() && !input.is_empty() {
+        return Err(VecOpsError::ExecutionFailed(format!(
+            "bit_reverse requires power of 2 length, got {}", input.len()
+        )));
+    }
+    bit_reverse_cpu(input)
+}
+
+#[cfg(not(feature = "gpu"))]
+pub fn bit_reverse_inplace(input: &mut [Fq]) -> Result<(), VecOpsError> {
+    if !input.len().is_power_of_two() && !input.is_empty() {
+        return Err(VecOpsError::ExecutionFailed(format!(
+            "bit_reverse_inplace requires power of 2 length, got {}", input.len()
+        )));
+    }
+    bit_reverse_inplace_cpu(input);
+    Ok(())
+}
+
 // CPU fallback implementations for non-GPU builds
 #[cfg(not(feature = "gpu"))]
 pub fn vector_add(a: &[Fq], b: &[Fq]) -> Result<Vec<Fq>, VecOpsError> {
@@ -449,5 +656,92 @@ mod tests {
         assert!(vector_add(&empty, &empty).unwrap().is_empty());
         assert!(vector_sub(&empty, &empty).unwrap().is_empty());
         assert!(vector_mul(&empty, &empty).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_bit_reverse_index() {
+        // For log_n = 3 (N=8):
+        // 0 (000) -> 0 (000)
+        // 1 (001) -> 4 (100)
+        // 2 (010) -> 2 (010)
+        // 3 (011) -> 6 (110)
+        // 4 (100) -> 1 (001)
+        // 5 (101) -> 5 (101)
+        // 6 (110) -> 3 (011)
+        // 7 (111) -> 7 (111)
+        assert_eq!(bit_reverse_index(0, 3), 0);
+        assert_eq!(bit_reverse_index(1, 3), 4);
+        assert_eq!(bit_reverse_index(2, 3), 2);
+        assert_eq!(bit_reverse_index(3, 3), 6);
+        assert_eq!(bit_reverse_index(4, 3), 1);
+        assert_eq!(bit_reverse_index(5, 3), 5);
+        assert_eq!(bit_reverse_index(6, 3), 3);
+        assert_eq!(bit_reverse_index(7, 3), 7);
+    }
+
+    #[test]
+    fn test_bit_reverse_small() {
+        // Create a vector [0, 1, 2, 3, 4, 5, 6, 7] as field elements
+        let input: Vec<Fq> = (0..8u64).map(|i| Fq::from(i)).collect();
+        
+        let result = bit_reverse(&input).unwrap();
+        
+        // Expected: [0, 4, 2, 6, 1, 5, 3, 7]
+        assert_eq!(result.len(), 8);
+        assert_eq!(result[0], Fq::from(0u64));
+        assert_eq!(result[1], Fq::from(4u64));
+        assert_eq!(result[2], Fq::from(2u64));
+        assert_eq!(result[3], Fq::from(6u64));
+        assert_eq!(result[4], Fq::from(1u64));
+        assert_eq!(result[5], Fq::from(5u64));
+        assert_eq!(result[6], Fq::from(3u64));
+        assert_eq!(result[7], Fq::from(7u64));
+    }
+
+    #[test]
+    fn test_bit_reverse_inplace_small() {
+        let mut input: Vec<Fq> = (0..8u64).map(|i| Fq::from(i)).collect();
+        
+        bit_reverse_inplace(&mut input).unwrap();
+        
+        // Same expected result as above
+        assert_eq!(input[0], Fq::from(0u64));
+        assert_eq!(input[1], Fq::from(4u64));
+        assert_eq!(input[2], Fq::from(2u64));
+        assert_eq!(input[3], Fq::from(6u64));
+        assert_eq!(input[4], Fq::from(1u64));
+        assert_eq!(input[5], Fq::from(5u64));
+        assert_eq!(input[6], Fq::from(3u64));
+        assert_eq!(input[7], Fq::from(7u64));
+    }
+
+    #[test]
+    fn test_bit_reverse_double_is_identity() {
+        let input: Vec<Fq> = (0..16u64).map(|i| Fq::from(i * 7 + 3)).collect();
+        
+        let once = bit_reverse(&input).unwrap();
+        let twice = bit_reverse(&once).unwrap();
+        
+        assert_eq!(input, twice, "Double bit-reverse should be identity");
+    }
+
+    #[test]
+    fn test_bit_reverse_non_power_of_two_fails() {
+        let input = vec![Fq::ONE; 5]; // Not a power of 2
+        
+        assert!(matches!(
+            bit_reverse(&input),
+            Err(VecOpsError::ExecutionFailed(_))
+        ));
+    }
+
+    #[test]
+    fn test_bit_reverse_empty() {
+        let empty: Vec<Fq> = vec![];
+        assert!(bit_reverse(&empty).unwrap().is_empty());
+        
+        let mut empty_mut: Vec<Fq> = vec![];
+        bit_reverse_inplace(&mut empty_mut).unwrap();
+        assert!(empty_mut.is_empty());
     }
 }

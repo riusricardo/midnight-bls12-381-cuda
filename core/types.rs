@@ -50,7 +50,11 @@
 //! | Scalar slice (2^16) | ~50ms | <1μs | ~50,000x |
 //! | Point slice (2^16) | ~100ms | ~10ms | ~10x |
 
-use midnight_curves::{Fq as Scalar, Fp, Fp2, G1Affine, G1Projective, G2Affine, G2Projective};
+use midnight_curves::{Fq as Scalar, Fp, G1Affine, G1Projective, G2Affine, G2Projective};
+// Import Fp2 from the bls12_381 submodule (not re-exported at root level)
+use midnight_curves::bls12_381::Fp2;
+// CurveAffine trait provides from_xy and coordinates methods used in conversions
+use midnight_curves::CurveAffine;
 
 #[cfg(feature = "gpu")]
 use icicle_bls12_381::curve::{
@@ -64,9 +68,6 @@ use icicle_bls12_381::curve::{
 };
 #[cfg(feature = "gpu")]
 use ff::PrimeField;
-// CurveAffine trait provides from_xy method used in ICICLE->midnight conversions
-#[cfg(feature = "gpu")]
-use halo2curves::CurveAffine;
 #[cfg(feature = "gpu")]
 use icicle_core::bignum::BigNum;
 #[cfg(feature = "gpu")]

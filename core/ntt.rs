@@ -64,8 +64,10 @@ use crate::{TypeConverter, stream::ManagedStream};
 #[cfg(feature = "gpu")]
 use midnight_curves::Fq as Scalar;
 
-#[cfg(feature = "gpu")]
-use once_cell::sync::OnceCell;
+// For CPU fallback, we need Scalar in non-GPU builds too
+#[cfg(not(feature = "gpu"))]
+use midnight_curves::Fq as Scalar;
+
 use tracing::debug;
 #[cfg(feature = "trace-fft")]
 use tracing::info;
@@ -75,7 +77,10 @@ use icicle_bls12_381::curve::ScalarField as IcicleScalar;
 #[cfg(feature = "gpu")]
 use icicle_core::bignum::BigNum;
 #[cfg(feature = "gpu")]
-use icicle_core::ntt::{ntt, ntt_inplace, NTTConfig, NTTDir, NTTDomain, NTTInitDomainConfig, Ordering};
+use icicle_core::ntt::{
+    ntt, ntt_inplace, NTTConfig, NTTDir, NTTDomain, NTTInitDomainConfig, Ordering,
+    CUDA_NTT_FAST_TWIDDLES_MODE, CUDA_NTT_ALGORITHM,
+};
 #[cfg(feature = "gpu")]
 use icicle_runtime::{
     Device, 
@@ -117,12 +122,54 @@ impl From<GpuError> for NttError {
     }
 }
 
+/// Convert our NttOrdering to ICICLE's Ordering enum
+#[cfg(feature = "gpu")]
+fn to_icicle_ordering(ordering: crate::config::NttOrdering) -> Ordering {
+    use crate::config::NttOrdering;
+    match ordering {
+        NttOrdering::NN => Ordering::kNN,
+        NttOrdering::NR => Ordering::kNR,
+        NttOrdering::RN => Ordering::kRN,
+        NttOrdering::RR => Ordering::kRR,
+        NttOrdering::NM => Ordering::kNM,
+        NttOrdering::MN => Ordering::kMN,
+    }
+}
+
+/// Get the effective ordering for a given NTT direction.
+///
+/// When mixed ordering mode is enabled (`MIDNIGHT_NTT_MIXED_ORDERING=true`):
+/// - Forward NTT uses kNM ordering
+/// - Inverse NTT uses kMN ordering
+///
+/// This is optimal for the workflow: NTT -> element-wise ops -> INTT
+/// because it avoids intermediate reordering.
+#[cfg(feature = "gpu")]
+fn effective_ordering(direction: NTTDir) -> Ordering {
+    use crate::config::ntt_use_mixed_ordering;
+    
+    if ntt_use_mixed_ordering() {
+        match direction {
+            NTTDir::kForward => Ordering::kNM,
+            NTTDir::kInverse => Ordering::kMN,
+        }
+    } else {
+        Ordering::kNN // Default: natural ordering
+    }
+}
+
 /// Global NTT domain state - initialized once per max_log_size
 /// 
 /// ICICLE's NTT domain is a global singleton per field. We track whether
 /// it has been initialized and for what maximum size.
+/// 
+/// Using AtomicU32 for thread-safe updates when domain needs resizing.
 #[cfg(feature = "gpu")]
-static NTT_DOMAIN_INITIALIZED: OnceCell<u32> = OnceCell::new();
+static NTT_DOMAIN_SIZE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Mutex to protect domain initialization/reinitialization
+#[cfg(feature = "gpu")]
+static NTT_DOMAIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// GPU NTT Context for polynomial transformations
 /// 
@@ -198,15 +245,43 @@ impl GpuNttContext {
     /// Ensure NTT domain is initialized for at least the given size
     /// 
     /// This uses ICICLE's built-in root of unity for the BLS12-381 scalar field.
+    /// 
+    /// # Fast Twiddles Mode
+    /// 
+    /// When enabled (via `MIDNIGHT_NTT_FAST_TWIDDLES=true`), the domain is initialized
+    /// with precomputed twiddle factors that enable faster NTT operations at the cost
+    /// of additional GPU memory. This is recommended when using the Mixed-Radix algorithm.
+    /// 
+    /// From ICICLE docs:
+    /// > "When using the Mixed-radix algorithm, it is recommended to initialize the domain
+    /// > in 'fast-twiddles' mode. This is essentially allocating the domain using extra
+    /// > memory but enables faster NTT."
     fn ensure_domain_initialized(max_log_size: u32) -> Result<(), NttError> {
-        // Check if already initialized with sufficient size
-        if let Some(&current_size) = NTT_DOMAIN_INITIALIZED.get() {
-            if current_size >= max_log_size {
-                debug!("NTT domain already initialized for size 2^{}", current_size);
-                return Ok(());
-            }
-            // Need larger domain - release and reinitialize
-            debug!("Releasing NTT domain to reinitialize with larger size");
+        use crate::config::ntt_fast_twiddles;
+        use std::sync::atomic::Ordering;
+        
+        // Fast path: check if already initialized with sufficient size
+        let current_size = NTT_DOMAIN_SIZE.load(Ordering::Acquire);
+        if current_size >= max_log_size {
+            debug!("NTT domain already initialized for size 2^{}", current_size);
+            return Ok(());
+        }
+        
+        // Slow path: acquire lock and reinitialize
+        let _guard = NTT_DOMAIN_LOCK.lock().map_err(|e| {
+            NttError::DomainInitFailed(format!("Failed to acquire domain lock: {:?}", e))
+        })?;
+        
+        // Double-check after acquiring lock (another thread may have initialized)
+        let current_size = NTT_DOMAIN_SIZE.load(Ordering::Acquire);
+        if current_size >= max_log_size {
+            debug!("NTT domain already initialized for size 2^{} (after lock)", current_size);
+            return Ok(());
+        }
+        
+        // Release existing domain if any
+        if current_size > 0 {
+            debug!("Releasing NTT domain to reinitialize with larger size ({} -> {})", current_size, max_log_size);
             <IcicleScalar as NTTDomain<IcicleScalar>>::release_domain()
                 .map_err(|e| NttError::DomainInitFailed(format!("Failed to release domain: {:?}", e)))?;
         }
@@ -217,19 +292,30 @@ impl GpuNttContext {
             .map_err(|e| NttError::DomainInitFailed(format!("Failed to get root of unity: {:?}", e)))?;
         
         // Initialize domain with ICICLE's root of unity
+        // Enable fast twiddles mode for better Mixed-Radix performance
         let init_cfg = NTTInitDomainConfig::default();
+        let fast_twiddles = ntt_fast_twiddles();
+        init_cfg.ext.set_bool(CUDA_NTT_FAST_TWIDDLES_MODE, fast_twiddles);
         
         #[cfg(feature = "trace-fft")]
         let start = std::time::Instant::now();
+        
+        debug!(
+            "Initializing NTT domain: size=2^{}, fast_twiddles={}",
+            max_log_size, fast_twiddles
+        );
         
         <IcicleScalar as NTTDomain<IcicleScalar>>::initialize_domain(primitive_root, &init_cfg)
             .map_err(|e| NttError::DomainInitFailed(format!("Failed to initialize domain: {:?}", e)))?;
         
         #[cfg(feature = "trace-fft")]
-        info!("NTT domain initialized for size 2^{} in {:?}", max_log_size, start.elapsed());
+        info!(
+            "NTT domain initialized for size 2^{} in {:?} (fast_twiddles={})", 
+            max_log_size, start.elapsed(), fast_twiddles
+        );
         
-        // Update global state (only once - OnceCell)
-        let _ = NTT_DOMAIN_INITIALIZED.set(max_log_size);
+        // Update global state atomically
+        NTT_DOMAIN_SIZE.store(max_log_size, Ordering::Release);
         
         Ok(())
     }
@@ -278,6 +364,7 @@ impl GpuNttContext {
     
     /// Internal NTT implementation (allocating version)
     fn ntt_internal(&self, input: &[Scalar], direction: NTTDir) -> Result<Vec<Scalar>, NttError> {
+        use crate::config::ntt_algorithm;
         use icicle_runtime::set_device;
         
         let n = input.len();
@@ -307,12 +394,19 @@ impl GpuNttContext {
         // Allocate output buffer
         let mut output = vec![<IcicleScalar as BigNum>::zero(); n];
         
-        // Configure NTT
+        // Configure NTT with algorithm selection
+        // From ICICLE docs:
+        // - Radix2: better for small NTTs (log_n ≤ 16, batch_size = 1)
+        // - MixedRadix: better for large NTTs and batch operations
         let mut cfg = NTTConfig::<IcicleScalar>::default();
-        cfg.ordering = Ordering::kNN;  // Natural-Natural ordering
+        cfg.ordering = effective_ordering(direction);  // Use configured ordering
         cfg.are_inputs_on_device = false;
         cfg.are_outputs_on_device = false;
         cfg.is_async = false;
+        
+        // Apply algorithm selection from config
+        let alg = ntt_algorithm();
+        cfg.ext.set_int(CUDA_NTT_ALGORITHM, alg as i32);
         
         // Execute NTT
         ntt(
@@ -332,6 +426,7 @@ impl GpuNttContext {
     
     /// Internal in-place NTT implementation
     fn ntt_inplace_internal(&self, data: &mut [Scalar], direction: NTTDir) -> Result<(), NttError> {
+        use crate::config::ntt_algorithm;
         use icicle_runtime::set_device;
         
         let n = data.len();
@@ -359,12 +454,16 @@ impl GpuNttContext {
         // We can operate directly on the midnight scalar data
         let icicle_data = TypeConverter::scalar_slice_as_icicle_mut(data);
         
-        // Configure NTT
+        // Configure NTT with algorithm selection
         let mut cfg = NTTConfig::<IcicleScalar>::default();
-        cfg.ordering = Ordering::kNN;
+        cfg.ordering = effective_ordering(direction);  // Use configured ordering
         cfg.are_inputs_on_device = false;
         cfg.are_outputs_on_device = false;
         cfg.is_async = false;
+        
+        // Apply algorithm selection from config
+        let alg = ntt_algorithm();
+        cfg.ext.set_int(CUDA_NTT_ALGORITHM, alg as i32);
         
         // Execute in-place NTT
         ntt_inplace(
@@ -392,6 +491,7 @@ impl GpuNttContext {
         device_data: &mut DeviceVec<IcicleScalar>,
         direction: NTTDir,
     ) -> Result<(), NttError> {
+        use crate::config::ntt_algorithm;
         use icicle_runtime::set_device;
         
         let n = device_data.len();
@@ -410,10 +510,14 @@ impl GpuNttContext {
         
         // Configure NTT for device data - synchronous on default stream
         let mut cfg = NTTConfig::<IcicleScalar>::default();
-        cfg.ordering = Ordering::kNN;
+        cfg.ordering = effective_ordering(direction);  // Use configured ordering
         cfg.are_inputs_on_device = true;
         cfg.are_outputs_on_device = true;
         cfg.is_async = false;
+        
+        // Apply algorithm selection from config
+        let alg = ntt_algorithm();
+        cfg.ext.set_int(CUDA_NTT_ALGORITHM, alg as i32);
         
         // Execute in-place on device
         ntt_inplace(
@@ -483,6 +587,7 @@ impl GpuNttContext {
         coset_gen: &IcicleScalar,
         direction: NTTDir,
     ) -> Result<(), NttError> {
+        use crate::config::ntt_algorithm;
         use icicle_runtime::set_device;
 
         let n = device_data.len();
@@ -499,11 +604,15 @@ impl GpuNttContext {
         let start = std::time::Instant::now();
 
         let mut cfg = NTTConfig::<IcicleScalar>::default();
-        cfg.ordering = Ordering::kNN;
+        cfg.ordering = effective_ordering(direction);  // Use configured ordering
         cfg.coset_gen = *coset_gen;
         cfg.are_inputs_on_device = true;
         cfg.are_outputs_on_device = true;
         cfg.is_async = false;
+
+        // Set algorithm selection via ConfigExtension (ICICLE best practice)
+        let alg = ntt_algorithm();
+        cfg.ext.set_int(CUDA_NTT_ALGORITHM, alg as i32);
 
         ntt_inplace(
             &mut device_data[..],
@@ -536,6 +645,7 @@ impl GpuNttContext {
         direction: NTTDir,
         coset_gen: Option<&IcicleScalar>,
     ) -> Result<(), NttError> {
+        use crate::config::ntt_algorithm;
         use icicle_runtime::set_device;
 
         if !poly_size.is_power_of_two() {
@@ -567,11 +677,15 @@ impl GpuNttContext {
         let start = std::time::Instant::now();
 
         let mut cfg = NTTConfig::<IcicleScalar>::default();
-        cfg.ordering = Ordering::kNN;
+        cfg.ordering = effective_ordering(direction);  // Use configured ordering
         cfg.batch_size = batch_count as i32;
         cfg.are_inputs_on_device = true;
         cfg.are_outputs_on_device = true;
         cfg.is_async = false;
+
+        // Apply algorithm selection - MixedRadix recommended for batch operations
+        let alg = ntt_algorithm();
+        cfg.ext.set_int(CUDA_NTT_ALGORITHM, alg as i32);
 
         if let Some(coset) = coset_gen {
             cfg.coset_gen = *coset;
@@ -599,6 +713,7 @@ impl GpuNttContext {
         direction: NTTDir,
         stream: &ManagedStream,
     ) -> Result<(), NttError> {
+        use crate::config::ntt_algorithm;
         use icicle_runtime::set_device;
 
         let n = device_data.len();
@@ -613,10 +728,14 @@ impl GpuNttContext {
 
         let mut cfg = NTTConfig::<IcicleScalar>::default();
         cfg.stream_handle = stream.as_ref().into();
-        cfg.ordering = Ordering::kNN;
+        cfg.ordering = effective_ordering(direction);  // Use configured ordering
         cfg.are_inputs_on_device = true;
         cfg.are_outputs_on_device = true;
         cfg.is_async = true;
+        
+        // Apply algorithm selection
+        let alg = ntt_algorithm();
+        cfg.ext.set_int(CUDA_NTT_ALGORITHM, alg as i32);
 
         ntt_inplace(
             &mut device_data[..],
@@ -635,6 +754,7 @@ impl GpuNttContext {
         direction: NTTDir,
         stream: &ManagedStream,
     ) -> Result<(), NttError> {
+        use crate::config::ntt_algorithm;
         use icicle_runtime::set_device;
 
         if !poly_size.is_power_of_two() {
@@ -657,11 +777,15 @@ impl GpuNttContext {
 
         let mut cfg = NTTConfig::<IcicleScalar>::default();
         cfg.stream_handle = stream.as_ref().into();
-        cfg.ordering = Ordering::kNN;
+        cfg.ordering = effective_ordering(direction);  // Use configured ordering
         cfg.batch_size = batch_count as i32;
         cfg.are_inputs_on_device = true;
         cfg.are_outputs_on_device = true;
         cfg.is_async = true;
+        
+        // Apply algorithm selection
+        let alg = ntt_algorithm();
+        cfg.ext.set_int(CUDA_NTT_ALGORITHM, alg as i32);
 
         ntt_inplace(
             &mut device_data[..],
@@ -708,6 +832,7 @@ impl GpuNttContext {
 
     /// Internal async NTT implementation
     fn ntt_async_internal(&self, input: &[Scalar], direction: NTTDir) -> Result<NttHandle, NttError> {
+        use crate::config::ntt_algorithm;
         use icicle_runtime::set_device;
 
         let n = input.len();
@@ -750,10 +875,14 @@ impl GpuNttContext {
         // Configure NTT - async on our stream
         let mut cfg = NTTConfig::<IcicleScalar>::default();
         cfg.stream_handle = stream.as_ref().into();
-        cfg.ordering = Ordering::kNN;
+        cfg.ordering = effective_ordering(direction);  // Use configured ordering
         cfg.are_inputs_on_device = true;
         cfg.are_outputs_on_device = true;
         cfg.is_async = true;
+
+        // Set algorithm selection via ConfigExtension (ICICLE best practice)
+        let alg = ntt_algorithm();
+        cfg.ext.set_int(CUDA_NTT_ALGORITHM, alg as i32);
 
         // Launch async NTT (in-place on device)
         ntt_inplace(
@@ -815,6 +944,7 @@ impl GpuNttContext {
         direction: NTTDir,
         coset_gen: Option<Scalar>,
     ) -> Result<Vec<Scalar>, NttError> {
+        use crate::config::ntt_algorithm;
         use icicle_runtime::set_device;
 
         if !poly_size.is_power_of_two() {
@@ -850,13 +980,18 @@ impl GpuNttContext {
         // Allocate output buffer
         let mut output = vec![<IcicleScalar as BigNum>::zero(); batch.len()];
 
-        // Configure batch NTT
+        // Configure batch NTT with algorithm selection
+        // MixedRadix is recommended for batch operations
         let mut cfg = NTTConfig::<IcicleScalar>::default();
-        cfg.ordering = Ordering::kNN;
+        cfg.ordering = effective_ordering(direction);  // Use configured ordering
         cfg.batch_size = batch_count as i32;
         cfg.are_inputs_on_device = false;
         cfg.are_outputs_on_device = false;
         cfg.is_async = false;
+        
+        // Apply algorithm selection
+        let alg = ntt_algorithm();
+        cfg.ext.set_int(CUDA_NTT_ALGORITHM, alg as i32);
 
         // Set coset generator if provided
         if let Some(coset) = coset_gen {
@@ -889,6 +1024,7 @@ impl GpuNttContext {
         direction: NTTDir,
         coset_gen: Option<Scalar>,
     ) -> Result<(), NttError> {
+        use crate::config::ntt_algorithm;
         use icicle_runtime::set_device;
 
         if !poly_size.is_power_of_two() {
@@ -921,13 +1057,17 @@ impl GpuNttContext {
         // Zero-copy mutable transmute
         let icicle_data = TypeConverter::scalar_slice_as_icicle_mut(batch);
 
-        // Configure batch NTT
+        // Configure batch NTT with algorithm selection
         let mut cfg = NTTConfig::<IcicleScalar>::default();
-        cfg.ordering = Ordering::kNN;
+        cfg.ordering = effective_ordering(direction);  // Use configured ordering
         cfg.batch_size = batch_count as i32;
         cfg.are_inputs_on_device = false;
         cfg.are_outputs_on_device = false;
         cfg.is_async = false;
+        
+        // Apply algorithm selection
+        let alg = ntt_algorithm();
+        cfg.ext.set_int(CUDA_NTT_ALGORITHM, alg as i32);
 
         // Set coset generator if provided
         if let Some(coset) = coset_gen {
@@ -991,6 +1131,7 @@ impl GpuNttContext {
 
     /// Internal coset NTT implementation
     fn coset_ntt_internal(&self, input: &[Scalar], coset_gen: Scalar, direction: NTTDir) -> Result<Vec<Scalar>, NttError> {
+        use crate::config::ntt_algorithm;
         use icicle_runtime::set_device;
 
         let n = input.len();
@@ -1020,13 +1161,17 @@ impl GpuNttContext {
         // Allocate output
         let mut output = vec![<IcicleScalar as BigNum>::zero(); n];
 
-        // Configure coset NTT
+        // Configure coset NTT with algorithm selection
         let mut cfg = NTTConfig::<IcicleScalar>::default();
-        cfg.ordering = Ordering::kNN;
+        cfg.ordering = effective_ordering(direction);  // Use configured ordering
         cfg.coset_gen = icicle_coset[0];
         cfg.are_inputs_on_device = false;
         cfg.are_outputs_on_device = false;
         cfg.is_async = false;
+        
+        // Apply algorithm selection
+        let alg = ntt_algorithm();
+        cfg.ext.set_int(CUDA_NTT_ALGORITHM, alg as i32);
 
         // Execute coset NTT
         ntt(
@@ -1045,7 +1190,9 @@ impl GpuNttContext {
 
     /// Internal coset NTT in-place implementation
     fn coset_ntt_inplace_internal(&self, data: &mut [Scalar], coset_gen: Scalar, direction: NTTDir) -> Result<(), NttError> {
+        use crate::config::ntt_algorithm;
         use icicle_runtime::set_device;
+
 
         let n = data.len();
         if !n.is_power_of_two() {
@@ -1071,13 +1218,17 @@ impl GpuNttContext {
         let icicle_data = TypeConverter::scalar_slice_as_icicle_mut(data);
         let icicle_coset = TypeConverter::scalar_slice_as_icicle(std::slice::from_ref(&coset_gen));
 
-        // Configure coset NTT
+        // Configure coset NTT with algorithm selection
         let mut cfg = NTTConfig::<IcicleScalar>::default();
-        cfg.ordering = Ordering::kNN;
+        cfg.ordering = effective_ordering(direction);  // Use configured ordering
         cfg.coset_gen = icicle_coset[0];
         cfg.are_inputs_on_device = false;
         cfg.are_outputs_on_device = false;
         cfg.is_async = false;
+        
+        // Apply algorithm selection
+        let alg = ntt_algorithm();
+        cfg.ext.set_int(CUDA_NTT_ALGORITHM, alg as i32);
 
         // Execute in-place coset NTT
         ntt_inplace(
@@ -1188,6 +1339,336 @@ impl NttHandle {
     pub fn size(&self) -> usize {
         self.size
     }
+}
+
+// =============================================================================
+// CPU NTT Implementation (using halo2curves FFT)
+// =============================================================================
+//
+// This provides a CPU fallback for small NTTs where GPU transfer overhead
+// would dominate. Uses halo2curves::fft::best_fft which is highly optimized
+// for CPU with SIMD support.
+
+/// CPU NTT using halo2curves FFT
+///
+/// This is used when:
+/// - GPU feature is not enabled, or
+/// - NTT size is below the threshold (`MIDNIGHT_NTT_MIN_K`), or
+/// - `MIDNIGHT_DEVICE=cpu` is set
+pub mod cpu {
+    use super::{NttError, Scalar};
+    use ff::{Field, PrimeField};
+
+    /// Compute the omega (root of unity) for a given log2 size
+    ///
+    /// This derives omega from Scalar::ROOT_OF_UNITY by squaring S-k times,
+    /// where S is the two-adicity of the field.
+    #[inline]
+    pub fn compute_omega(log_n: u32) -> Scalar {
+        let mut omega = Scalar::ROOT_OF_UNITY;
+        for _ in log_n..Scalar::S {
+            omega = omega.square();
+        }
+        omega
+    }
+
+    /// Compute omega inverse for inverse NTT
+    #[inline]
+    pub fn compute_omega_inv(log_n: u32) -> Scalar {
+        compute_omega(log_n).invert().unwrap()
+    }
+
+    /// Forward NTT using halo2curves FFT
+    ///
+    /// Transforms coefficients to evaluations.
+    pub fn forward_ntt(input: &[Scalar]) -> Result<Vec<Scalar>, NttError> {
+        let n = input.len();
+        if !n.is_power_of_two() {
+            return Err(NttError::InvalidSize(format!(
+                "NTT size must be power of 2, got {}", n
+            )));
+        }
+        
+        if n == 0 {
+            return Ok(vec![]);
+        }
+
+        let log_n = n.trailing_zeros();
+        let omega = compute_omega(log_n);
+
+        let mut output = input.to_vec();
+        halo2curves::fft::best_fft(&mut output, omega, log_n);
+
+        Ok(output)
+    }
+
+    /// Forward NTT in-place using halo2curves FFT
+    pub fn forward_ntt_inplace(data: &mut [Scalar]) -> Result<(), NttError> {
+        let n = data.len();
+        if !n.is_power_of_two() {
+            return Err(NttError::InvalidSize(format!(
+                "NTT size must be power of 2, got {}", n
+            )));
+        }
+        
+        if n == 0 {
+            return Ok(());
+        }
+
+        let log_n = n.trailing_zeros();
+        let omega = compute_omega(log_n);
+
+        halo2curves::fft::best_fft(data, omega, log_n);
+
+        Ok(())
+    }
+
+    /// Inverse NTT using halo2curves FFT
+    ///
+    /// Transforms evaluations back to coefficients.
+    /// Applies the standard 1/n scaling.
+    pub fn inverse_ntt(input: &[Scalar]) -> Result<Vec<Scalar>, NttError> {
+        let n = input.len();
+        if !n.is_power_of_two() {
+            return Err(NttError::InvalidSize(format!(
+                "NTT size must be power of 2, got {}", n
+            )));
+        }
+        
+        if n == 0 {
+            return Ok(vec![]);
+        }
+
+        let log_n = n.trailing_zeros();
+        let omega_inv = compute_omega_inv(log_n);
+
+        let mut output = input.to_vec();
+        halo2curves::fft::best_fft(&mut output, omega_inv, log_n);
+
+        // Scale by 1/n
+        let n_inv = Scalar::from(n as u64).invert().unwrap();
+        for val in output.iter_mut() {
+            *val *= n_inv;
+        }
+
+        Ok(output)
+    }
+
+    /// Inverse NTT in-place using halo2curves FFT
+    pub fn inverse_ntt_inplace(data: &mut [Scalar]) -> Result<(), NttError> {
+        let n = data.len();
+        if !n.is_power_of_two() {
+            return Err(NttError::InvalidSize(format!(
+                "NTT size must be power of 2, got {}", n
+            )));
+        }
+        
+        if n == 0 {
+            return Ok(());
+        }
+
+        let log_n = n.trailing_zeros();
+        let omega_inv = compute_omega_inv(log_n);
+
+        halo2curves::fft::best_fft(data, omega_inv, log_n);
+
+        // Scale by 1/n
+        let n_inv = Scalar::from(n as u64).invert().unwrap();
+        for val in data.iter_mut() {
+            *val *= n_inv;
+        }
+
+        Ok(())
+    }
+
+    /// Batch forward NTT on CPU
+    pub fn forward_ntt_batch(batch: &[Scalar], poly_size: usize) -> Result<Vec<Scalar>, NttError> {
+        if !poly_size.is_power_of_two() {
+            return Err(NttError::InvalidSize(format!(
+                "Polynomial size must be power of 2, got {}", poly_size
+            )));
+        }
+        
+        if batch.len() % poly_size != 0 {
+            return Err(NttError::InvalidSize(format!(
+                "Batch length {} not divisible by poly_size {}", batch.len(), poly_size
+            )));
+        }
+
+        let mut output = batch.to_vec();
+        let log_n = poly_size.trailing_zeros();
+        let omega = compute_omega(log_n);
+
+        // Process each polynomial
+        for chunk in output.chunks_mut(poly_size) {
+            halo2curves::fft::best_fft(chunk, omega, log_n);
+        }
+
+        Ok(output)
+    }
+
+    /// Batch inverse NTT on CPU
+    pub fn inverse_ntt_batch(batch: &[Scalar], poly_size: usize) -> Result<Vec<Scalar>, NttError> {
+        if !poly_size.is_power_of_two() {
+            return Err(NttError::InvalidSize(format!(
+                "Polynomial size must be power of 2, got {}", poly_size
+            )));
+        }
+        
+        if batch.len() % poly_size != 0 {
+            return Err(NttError::InvalidSize(format!(
+                "Batch length {} not divisible by poly_size {}", batch.len(), poly_size
+            )));
+        }
+
+        let mut output = batch.to_vec();
+        let log_n = poly_size.trailing_zeros();
+        let omega_inv = compute_omega_inv(log_n);
+        let n_inv = Scalar::from(poly_size as u64).invert().unwrap();
+
+        // Process each polynomial
+        for chunk in output.chunks_mut(poly_size) {
+            halo2curves::fft::best_fft(chunk, omega_inv, log_n);
+            // Scale by 1/n
+            for val in chunk.iter_mut() {
+                *val *= n_inv;
+            }
+        }
+
+        Ok(output)
+    }
+}
+
+// =============================================================================
+// Unified NTT API with GPU/CPU Decision
+// =============================================================================
+//
+// These functions automatically choose between GPU and CPU based on:
+// - MIDNIGHT_DEVICE environment variable
+// - MIDNIGHT_NTT_MIN_K threshold (default: 12, meaning 4096 elements)
+
+/// Default maximum log size for auto-created NTT contexts
+/// This ensures the domain is initialized large enough for typical use cases.
+const DEFAULT_MAX_LOG_SIZE: u32 = 20; // Supports up to 2^20 = 1M elements
+
+/// Forward NTT with automatic GPU/CPU selection
+///
+/// Uses GPU for large NTTs (>= 4096 elements by default), CPU for smaller ones.
+/// Override with `MIDNIGHT_DEVICE=gpu` or `MIDNIGHT_DEVICE=cpu`.
+#[cfg(feature = "gpu")]
+pub fn forward_ntt_auto(input: &[Scalar]) -> Result<Vec<Scalar>, NttError> {
+    use crate::config::should_use_gpu_ntt;
+    
+    if should_use_gpu_ntt(input.len()) {
+        // Use GPU - initialize with large enough domain
+        let log_n = input.len().trailing_zeros();
+        let ctx = GpuNttContext::new(log_n.max(DEFAULT_MAX_LOG_SIZE))?;
+        ctx.forward_ntt(input)
+    } else {
+        // Use CPU
+        cpu::forward_ntt(input)
+    }
+}
+
+/// Inverse NTT with automatic GPU/CPU selection
+#[cfg(feature = "gpu")]
+pub fn inverse_ntt_auto(input: &[Scalar]) -> Result<Vec<Scalar>, NttError> {
+    use crate::config::should_use_gpu_ntt;
+    
+    if should_use_gpu_ntt(input.len()) {
+        let log_n = input.len().trailing_zeros();
+        let ctx = GpuNttContext::new(log_n.max(DEFAULT_MAX_LOG_SIZE))?;
+        ctx.inverse_ntt(input)
+    } else {
+        cpu::inverse_ntt(input)
+    }
+}
+
+/// Forward NTT in-place with automatic GPU/CPU selection
+#[cfg(feature = "gpu")]
+pub fn forward_ntt_inplace_auto(data: &mut [Scalar]) -> Result<(), NttError> {
+    use crate::config::should_use_gpu_ntt;
+    
+    if should_use_gpu_ntt(data.len()) {
+        let log_n = data.len().trailing_zeros();
+        let ctx = GpuNttContext::new(log_n.max(DEFAULT_MAX_LOG_SIZE))?;
+        ctx.forward_ntt_inplace(data)
+    } else {
+        cpu::forward_ntt_inplace(data)
+    }
+}
+
+/// Inverse NTT in-place with automatic GPU/CPU selection
+#[cfg(feature = "gpu")]
+pub fn inverse_ntt_inplace_auto(data: &mut [Scalar]) -> Result<(), NttError> {
+    use crate::config::should_use_gpu_ntt;
+    
+    if should_use_gpu_ntt(data.len()) {
+        let log_n = data.len().trailing_zeros();
+        let ctx = GpuNttContext::new(log_n.max(DEFAULT_MAX_LOG_SIZE))?;
+        ctx.inverse_ntt_inplace(data)
+    } else {
+        cpu::inverse_ntt_inplace(data)
+    }
+}
+
+/// Batch forward NTT with automatic GPU/CPU selection
+#[cfg(feature = "gpu")]
+pub fn forward_ntt_batch_auto(batch: &[Scalar], poly_size: usize) -> Result<Vec<Scalar>, NttError> {
+    use crate::config::should_use_gpu_ntt;
+    
+    if should_use_gpu_ntt(poly_size) {
+        let log_n = poly_size.trailing_zeros();
+        let ctx = GpuNttContext::new(log_n.max(DEFAULT_MAX_LOG_SIZE))?;
+        ctx.forward_ntt_batch(batch, poly_size)
+    } else {
+        cpu::forward_ntt_batch(batch, poly_size)
+    }
+}
+
+/// Batch inverse NTT with automatic GPU/CPU selection
+#[cfg(feature = "gpu")]
+pub fn inverse_ntt_batch_auto(batch: &[Scalar], poly_size: usize) -> Result<Vec<Scalar>, NttError> {
+    use crate::config::should_use_gpu_ntt;
+    
+    if should_use_gpu_ntt(poly_size) {
+        let log_n = poly_size.trailing_zeros();
+        let ctx = GpuNttContext::new(log_n.max(DEFAULT_MAX_LOG_SIZE))?;
+        ctx.inverse_ntt_batch(batch, poly_size)
+    } else {
+        cpu::inverse_ntt_batch(batch, poly_size)
+    }
+}
+
+// Non-GPU builds: just use CPU implementation
+#[cfg(not(feature = "gpu"))]
+pub fn forward_ntt_auto(input: &[Scalar]) -> Result<Vec<Scalar>, NttError> {
+    cpu::forward_ntt(input)
+}
+
+#[cfg(not(feature = "gpu"))]
+pub fn inverse_ntt_auto(input: &[Scalar]) -> Result<Vec<Scalar>, NttError> {
+    cpu::inverse_ntt(input)
+}
+
+#[cfg(not(feature = "gpu"))]
+pub fn forward_ntt_inplace_auto(data: &mut [Scalar]) -> Result<(), NttError> {
+    cpu::forward_ntt_inplace(data)
+}
+
+#[cfg(not(feature = "gpu"))]
+pub fn inverse_ntt_inplace_auto(data: &mut [Scalar]) -> Result<(), NttError> {
+    cpu::inverse_ntt_inplace(data)
+}
+
+#[cfg(not(feature = "gpu"))]
+pub fn forward_ntt_batch_auto(batch: &[Scalar], poly_size: usize) -> Result<Vec<Scalar>, NttError> {
+    cpu::forward_ntt_batch(batch, poly_size)
+}
+
+#[cfg(not(feature = "gpu"))]
+pub fn inverse_ntt_batch_auto(batch: &[Scalar], poly_size: usize) -> Result<Vec<Scalar>, NttError> {
+    cpu::inverse_ntt_batch(batch, poly_size)
 }
 
 // =============================================================================
@@ -1500,6 +1981,273 @@ mod tests {
         // Verify roundtrip
         for (orig, rec) in original.iter().zip(recovered.iter()) {
             assert_eq!(*orig, *rec, "Batch coset NTT roundtrip should preserve values");
+        }
+    }
+}
+
+// =============================================================================
+// CPU NTT Tests (always available, even without GPU)
+// =============================================================================
+
+#[cfg(test)]
+mod cpu_tests {
+    use super::*;
+    use super::cpu;
+    use ff::Field;
+
+    /// Test CPU forward/inverse NTT roundtrip
+    #[test]
+    fn test_cpu_ntt_roundtrip() {
+        let n = 1 << 8; // 256 elements
+        let original: Vec<Scalar> = (0..n).map(|i| Scalar::from(i as u64 + 1)).collect();
+
+        // Forward NTT
+        let evaluations = cpu::forward_ntt(&original).expect("CPU forward NTT failed");
+        assert_eq!(evaluations.len(), n);
+
+        // Inverse NTT
+        let recovered = cpu::inverse_ntt(&evaluations).expect("CPU inverse NTT failed");
+        assert_eq!(recovered.len(), n);
+
+        // Verify roundtrip
+        for (i, (orig, rec)) in original.iter().zip(recovered.iter()).enumerate() {
+            assert_eq!(*orig, *rec, "CPU NTT roundtrip failed at index {}", i);
+        }
+    }
+
+    /// Test CPU NTT in-place
+    #[test]
+    fn test_cpu_ntt_inplace() {
+        let n = 1 << 6; // 64 elements
+        let original: Vec<Scalar> = (0..n).map(|i| Scalar::from(i as u64 * 7 + 3)).collect();
+        let mut data = original.clone();
+
+        // Forward in-place
+        cpu::forward_ntt_inplace(&mut data).expect("CPU forward NTT inplace failed");
+
+        // Inverse in-place
+        cpu::inverse_ntt_inplace(&mut data).expect("CPU inverse NTT inplace failed");
+
+        // Verify roundtrip
+        for (i, (orig, rec)) in original.iter().zip(data.iter()).enumerate() {
+            assert_eq!(*orig, *rec, "CPU in-place NTT roundtrip failed at index {}", i);
+        }
+    }
+
+    /// Test CPU NTT with identity polynomial
+    #[test]
+    fn test_cpu_ntt_identity() {
+        let n = 1 << 4; // 16 elements
+        let mut coeffs = vec![Scalar::ZERO; n];
+        coeffs[0] = Scalar::ONE;
+
+        let evaluations = cpu::forward_ntt(&coeffs).expect("CPU forward NTT failed");
+
+        // For constant polynomial c₀, all evaluations should equal c₀
+        for (i, eval) in evaluations.iter().enumerate() {
+            assert_eq!(*eval, Scalar::ONE, "Constant polynomial evaluation wrong at {}", i);
+        }
+    }
+
+    /// Test CPU NTT with linear polynomial
+    #[test]
+    fn test_cpu_ntt_linear() {
+        let n = 1 << 3; // 8 elements
+        // Polynomial: 1 + x (coefficients [1, 1, 0, 0, ...])
+        let mut coeffs = vec![Scalar::ZERO; n];
+        coeffs[0] = Scalar::ONE;
+        coeffs[1] = Scalar::ONE;
+
+        let evaluations = cpu::forward_ntt(&coeffs).expect("CPU forward NTT failed");
+        
+        // Each evaluation should be 1 + ω^i for the i-th root of unity
+        // We just verify roundtrip for now
+        let recovered = cpu::inverse_ntt(&evaluations).expect("CPU inverse NTT failed");
+        
+        for (i, (orig, rec)) in coeffs.iter().zip(recovered.iter()).enumerate() {
+            assert_eq!(*orig, *rec, "Linear polynomial roundtrip failed at {}", i);
+        }
+    }
+
+    /// Test CPU batch NTT
+    #[test]
+    fn test_cpu_batch_ntt() {
+        let poly_size = 1 << 4; // 16 elements per polynomial
+        let batch_count = 4;
+        let total_size = poly_size * batch_count;
+
+        let original: Vec<Scalar> = (0..total_size)
+            .map(|i| Scalar::from(i as u64 + 1))
+            .collect();
+
+        // Batch forward NTT
+        let evaluations = cpu::forward_ntt_batch(&original, poly_size)
+            .expect("CPU batch forward NTT failed");
+        assert_eq!(evaluations.len(), total_size);
+
+        // Batch inverse NTT
+        let recovered = cpu::inverse_ntt_batch(&evaluations, poly_size)
+            .expect("CPU batch inverse NTT failed");
+        assert_eq!(recovered.len(), total_size);
+
+        // Verify roundtrip
+        for (i, (orig, rec)) in original.iter().zip(recovered.iter()).enumerate() {
+            assert_eq!(*orig, *rec, "CPU batch NTT roundtrip failed at index {}", i);
+        }
+    }
+
+    /// Test omega computation
+    #[test]
+    fn test_omega_computation() {
+        // Test for various sizes
+        for log_n in 2..=8 {
+            let n = 1usize << log_n;
+            let omega = cpu::compute_omega(log_n as u32);
+            
+            // Verify ω^n = 1
+            let omega_n = omega.pow([n as u64, 0, 0, 0]);
+            assert_eq!(omega_n, Scalar::ONE, "ω^n should be 1 for log_n={}", log_n);
+            
+            // Verify ω^(n/2) ≠ 1 (primitive root check)
+            if log_n > 1 {
+                let half_n = n / 2;
+                let omega_half = omega.pow([half_n as u64, 0, 0, 0]);
+                assert_ne!(omega_half, Scalar::ONE, "ω^(n/2) should not be 1 for log_n={}", log_n);
+            }
+        }
+    }
+
+    /// Test CPU NTT error for non-power-of-2 sizes
+    #[test]
+    fn test_cpu_ntt_non_power_of_2() {
+        let coeffs: Vec<Scalar> = (0..13).map(|i| Scalar::from(i as u64)).collect();
+        
+        let result = cpu::forward_ntt(&coeffs);
+        assert!(result.is_err(), "Should fail for non-power-of-2 size");
+    }
+
+    /// Test that CPU NTT matches between allocating and in-place versions
+    #[test]
+    fn test_cpu_ntt_allocating_vs_inplace() {
+        let n = 1 << 7; // 128 elements
+        let original: Vec<Scalar> = (0..n).map(|i| Scalar::from(i as u64 * 3 + 5)).collect();
+        
+        // Allocating version
+        let alloc_result = cpu::forward_ntt(&original).expect("Allocating NTT failed");
+        
+        // In-place version
+        let mut inplace_data = original.clone();
+        cpu::forward_ntt_inplace(&mut inplace_data).expect("In-place NTT failed");
+        
+        // Results should match
+        for (i, (a, b)) in alloc_result.iter().zip(inplace_data.iter()).enumerate() {
+            assert_eq!(*a, *b, "Allocating vs in-place mismatch at index {}", i);
+        }
+    }
+}
+
+// =============================================================================
+// Auto-selection tests (test GPU/CPU switching)
+// =============================================================================
+
+#[cfg(test)]
+#[cfg(feature = "gpu")]
+mod auto_tests {
+    use super::*;
+    use ff::Field;
+
+    /// Test that auto functions work with GPU-sized inputs
+    #[test]
+    fn test_auto_ntt_large() {
+        // Use size above threshold (should use GPU if available)
+        let n = 1 << 13; // 8192 elements (above default threshold of 4096)
+        let original: Vec<Scalar> = (0..n).map(|i| Scalar::from(i as u64 + 1)).collect();
+
+        let evaluations = forward_ntt_auto(&original).expect("Auto forward NTT failed");
+        let recovered = inverse_ntt_auto(&evaluations).expect("Auto inverse NTT failed");
+
+        for (i, (orig, rec)) in original.iter().zip(recovered.iter()).enumerate() {
+            assert_eq!(*orig, *rec, "Auto NTT roundtrip failed at index {}", i);
+        }
+    }
+
+    /// Test that auto functions work with CPU-sized inputs
+    #[test]
+    fn test_auto_ntt_small() {
+        // Use size below threshold (should use CPU)
+        let n = 1 << 8; // 256 elements (below default threshold of 4096)
+        let original: Vec<Scalar> = (0..n).map(|i| Scalar::from(i as u64 + 1)).collect();
+
+        let evaluations = forward_ntt_auto(&original).expect("Auto forward NTT failed");
+        let recovered = inverse_ntt_auto(&evaluations).expect("Auto inverse NTT failed");
+
+        for (i, (orig, rec)) in original.iter().zip(recovered.iter()).enumerate() {
+            assert_eq!(*orig, *rec, "Auto NTT roundtrip (small) failed at index {}", i);
+        }
+    }
+
+    /// Test auto in-place functions
+    #[test]
+    fn test_auto_ntt_inplace() {
+        let n = 1 << 10;
+        let original: Vec<Scalar> = (0..n).map(|i| Scalar::from(i as u64 * 2 + 1)).collect();
+        let mut data = original.clone();
+
+        forward_ntt_inplace_auto(&mut data).expect("Auto forward NTT inplace failed");
+        inverse_ntt_inplace_auto(&mut data).expect("Auto inverse NTT inplace failed");
+
+        for (i, (orig, rec)) in original.iter().zip(data.iter()).enumerate() {
+            assert_eq!(*orig, *rec, "Auto in-place NTT roundtrip failed at index {}", i);
+        }
+    }
+
+    /// Test auto batch functions
+    #[test]
+    fn test_auto_batch_ntt() {
+        let poly_size = 1 << 6;
+        let batch_count = 8;
+        let total_size = poly_size * batch_count;
+
+        let original: Vec<Scalar> = (0..total_size)
+            .map(|i| Scalar::from(i as u64 + 1))
+            .collect();
+
+        let evaluations = forward_ntt_batch_auto(&original, poly_size)
+            .expect("Auto batch forward NTT failed");
+        let recovered = inverse_ntt_batch_auto(&evaluations, poly_size)
+            .expect("Auto batch inverse NTT failed");
+
+        for (i, (orig, rec)) in original.iter().zip(recovered.iter()).enumerate() {
+            assert_eq!(*orig, *rec, "Auto batch NTT roundtrip failed at index {}", i);
+        }
+    }
+
+    /// Test that CPU and GPU both produce correct roundtrip results
+    /// 
+    /// Note: CPU (halo2curves) and GPU (ICICLE) may use different primitive roots of unity,
+    /// so intermediate NTT results may differ. However, both should correctly roundtrip
+    /// (forward + inverse should return the original).
+    #[test]
+    fn test_cpu_gpu_both_roundtrip() {
+        let n = 1usize << 8; // 256 elements
+        let input: Vec<Scalar> = (0..n).map(|i| Scalar::from(i as u64 + 1)).collect();
+
+        // CPU roundtrip
+        let cpu_fwd = cpu::forward_ntt(&input).expect("CPU forward NTT failed");
+        let cpu_roundtrip = cpu::inverse_ntt(&cpu_fwd).expect("CPU inverse NTT failed");
+        
+        // GPU roundtrip
+        let log_n = n.trailing_zeros();
+        let ctx = GpuNttContext::new(log_n).expect("GPU context creation failed");
+        let gpu_fwd = ctx.forward_ntt(&input).expect("GPU forward NTT failed");
+        let gpu_roundtrip = ctx.inverse_ntt(&gpu_fwd).expect("GPU inverse NTT failed");
+
+        // Both should roundtrip correctly to original
+        for (i, orig) in input.iter().enumerate() {
+            assert_eq!(*orig, cpu_roundtrip[i], 
+                "CPU NTT roundtrip failed at index {}", i);
+            assert_eq!(*orig, gpu_roundtrip[i], 
+                "GPU NTT roundtrip failed at index {}", i);
         }
     }
 }

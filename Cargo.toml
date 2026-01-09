@@ -15,7 +15,7 @@ ff = "0.13"
 group = "0.13"
 # Note: halo2curves provides the CurveAffine trait needed for from_xy method
 halo2curves = { version = "0.7.0", default-features = false }
-midnight-curves = { path = "../curves", version = "0.1.1" }
+midnight-curves = { path = "../curves", version = "0.2.0" }
 rayon = "1.10"
 tracing = "0.1"
 
